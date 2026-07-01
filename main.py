@@ -190,27 +190,38 @@ def cmd_setrate(m):
 
 # ---------------- natural language ----------------
 
+CHAT_TRIGGERS = [
+    "how much", "what's my", "compare", "am i", "advice",
+    "saving", "spent", "earned", "biggest", "most", "least",
+    "last month", "this month", "last year", "this year",
+    "summary", "total", "average", "trend", "suggest",
+    "magkano", "kumusta", "ano", "bakit", "paano",
+]
+
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_text(m):
     if not authorized(m):
         return
     try:
         rate = rates.get_rate(sheets)
+        text_lower = m.text.lower()
+        is_question = any(t in text_lower for t in CHAT_TRIGGERS) or m.text.strip().endswith("?")
+        if is_question:
+            recent = sheets.get_recent_transactions(30)
+            reply = parser.chat(m.text, context_for_ai(), rate, recent)
+            return bot.reply_to(m, reply)
         parsed = parser.parse(m.text, context_for_ai(), rate)
         actions = parsed.get("actions", [])
         if not actions:
             return bot.reply_to(m, parsed.get("reply") or "I couldn't read that — try rephrasing.")
-
         built = []
         for a in actions:
             tx, question = logic.validate(a, rate)
             if question:
-                return bot.reply_to(m, question)  # ask, don't save anything yet
+                return bot.reply_to(m, question)
             built.append(tx)
-
         pending[m.from_user.id] = built
         summary = "\n\n".join(logic.confirm_text(tx) for tx in built)
-
         kb = types.InlineKeyboardMarkup()
         kb.row(
             types.InlineKeyboardButton("✅ Confirm", callback_data="confirm"),
@@ -220,8 +231,7 @@ def handle_text(m):
         bot.reply_to(m, summary, reply_markup=kb)
     except Exception as e:
         logging.exception("handle_text failed")
-        bot.reply_to(m, "Something went wrong on my side. Try again, or check logs/bot.log.")
-
+        bot.reply_to(m, "Something went wrong. Try again!")
 
 @bot.callback_query_handler(func=lambda c: True)
 def handle_button(c):
