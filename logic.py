@@ -72,7 +72,23 @@ def validate(action, rate):
         currency = "PHP"
 
     php_equiv = _convert(amount, currency, "PHP", rate)
-    used_rate = rate if currency == "USD" else 1
+
+    # Always store the real USD<->PHP rate used at the time of this
+    # transaction (not just "1 when currency is PHP"). Undo/reporting later
+    # needs the real rate to convert correctly in either direction — storing
+    # 1 whenever the tx happened to be in PHP silently threw that information
+    # away, which mattered as soon as an account's currency didn't match the
+    # transaction's currency (e.g. a USD expense logged against a PHP wallet).
+    used_rate = rate
+
+    # The amount actually applied to the account's own balance. A transaction
+    # can be logged in a different currency than the account holding it (the
+    # AI is allowed to pick e.g. "GCash" for a message that said "$20" if
+    # that's the closest account match) — so this always converts into the
+    # account's own currency before any balance math happens, exactly like
+    # transfers already do below via _out_amount/_in_amount.
+    acct_delta = _convert(amount, currency, acct["currency"], rate)
+
     tx = {
         "Transaction ID": _new_id(),
         "Created Timestamp": _now(),
@@ -91,6 +107,7 @@ def validate(action, rate):
         "Telegram User ID": "",
         "Status": "Active",
         "_account_currency": acct["currency"],   # internal, not written
+        "_acct_delta": round(acct_delta, 2),      # internal, not written
     }
     return tx, None
 
@@ -175,7 +192,12 @@ def apply(tx, user_id):
         )
 
     acct = sheets.get_account(tx["Account"])
-    delta = tx["Amount"] if tx["Type"] == "income" else -tx["Amount"]
+    # Use the pre-converted, account-currency delta computed in validate()
+    # rather than tx["Amount"] directly — tx["Amount"] is in the
+    # transaction's own currency, which is not guaranteed to match the
+    # account's currency.
+    acct_delta = tx.get("_acct_delta", tx["Amount"])
+    delta = acct_delta if tx["Type"] == "income" else -acct_delta
     new_bal = acct["balance"] + delta
     sheets.update_account_balance(acct["name"], new_bal)
     clean = {k: v for k, v in tx.items() if not k.startswith("_")}
@@ -205,21 +227,25 @@ def undo_last(user_id):
 def _reverse(r, user_id):
     typ = str(r.get("Type", "")).lower()
     amount = float(r.get("Amount", 0) or 0)
+    currency = r.get("Currency", "PHP") or "PHP"
+    stored_rate = float(r.get("Exchange Rate", 1) or 1)
     if typ == "transfer":
         src = sheets.get_account(r.get("Account"))
         dst = sheets.get_account(r.get("Destination Account"))
-        rate = float(r.get("Exchange Rate", 1) or 1)
-        out_amount = _convert(amount, r.get("Currency", "PHP"), src["currency"], rate)
-        in_amount = _convert(amount, r.get("Currency", "PHP"), dst["currency"], rate)
+        out_amount = _convert(amount, currency, src["currency"], stored_rate)
+        in_amount = _convert(amount, currency, dst["currency"], stored_rate)
         sheets.update_account_balance(src["name"], src["balance"] + out_amount)
         sheets.update_account_balance(dst["name"], dst["balance"] - in_amount)
     else:
         acct = sheets.get_account(r.get("Account"))
-        delta = -amount if typ == "income" else amount  # opposite of original
+        # Same fix as apply(): convert into the account's own currency before
+        # touching its balance, using the rate that was in effect at the time.
+        acct_amount = _convert(amount, currency, acct["currency"], stored_rate)
+        delta = -acct_amount if typ == "income" else acct_amount  # opposite of original
         sheets.update_account_balance(acct["name"], acct["balance"] + delta)
     sheets.mark_reversed(r.get("Transaction ID"))
     sheets.append_audit("undo", r.get("Transaction ID"), "reversed by user", user_id)
-    return f"↩️ Undone: {typ} {money(amount, r.get('Currency','PHP'))} on {r.get('Account')}."
+    return f"↩️ Undone: {typ} {money(amount, currency)} on {r.get('Account')}."
 
 
 def _new_id():

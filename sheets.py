@@ -15,13 +15,34 @@ import config
 _sh = None
 
 
+def _load_credentials_dict():
+    """
+    Parse GOOGLE_CREDENTIALS_JSON into a usable service-account dict.
+
+    Railway env vars are pasted as a single line, so the private_key field
+    inside the JSON needs its \\n sequences to be REAL newlines for Google's
+    crypto library to accept it as a valid PEM key. json.loads() already turns
+    a correctly-escaped "\\n" into a real newline character on its own — so in
+    the normal case no extra work is needed. But if the value ever gets
+    double-escaped along the way (copy/paste, an extra layer of quoting in the
+    Railway UI, etc.) the private_key can end up with literal backslash-n
+    characters instead of real newlines, which breaks the key. This
+    normalizes that field defensively, and is a no-op if it's already correct.
+    """
+    creds_dict = json.loads(config.GOOGLE_CREDENTIALS_JSON)
+    pk = creds_dict.get("private_key")
+    if isinstance(pk, str) and "\\n" in pk:
+        creds_dict["private_key"] = pk.replace("\\n", "\n")
+    return creds_dict
+
+
 def _book():
     global _sh
     if _sh is None:
         if os.path.exists(config.GOOGLE_SERVICE_ACCOUNT_FILE):
             gc = gspread.service_account(filename=config.GOOGLE_SERVICE_ACCOUNT_FILE)
         elif config.GOOGLE_CREDENTIALS_JSON:
-            gc = gspread.service_account_from_dict(json.loads(config.GOOGLE_CREDENTIALS_JSON))
+            gc = gspread.service_account_from_dict(_load_credentials_dict())
         else:
             raise RuntimeError("No Google credentials found (file or GOOGLE_CREDENTIALS_JSON).")
         _sh = gc.open_by_key(config.GOOGLE_SHEET_ID)
@@ -40,7 +61,6 @@ def _row_for(ws, col_index, value):
         if str(v).strip().lower() == target:
             return i
     return None
-
 
 # ---------- Accounts ----------
 
@@ -82,7 +102,6 @@ def update_account_balance(name, new_balance):
     ws.update_cell(row, bal_col, round(new_balance, 2))
     ws.update_cell(row, upd_col, _now())
 
-
 # ---------- Transactions ----------
 
 TX_HEADERS = [
@@ -123,7 +142,6 @@ def mark_reversed(transaction_id):
     if row:
         ws.update_cell(row, status_col, "Reversed")
 
-
 # ---------- Settings ----------
 
 def get_setting(key):
@@ -144,7 +162,6 @@ def set_setting(key, value):
         ws.update_cell(row, val_col, str(value))
     else:
         ws.append_row([key, str(value)], value_input_option="USER_ENTERED")
-
 
 # ---------- Lookup lists (for the AI) ----------
 
@@ -170,7 +187,6 @@ def get_clients():
     return [str(r.get("Client Name", "")).strip()
             for r in rows if str(r.get("Client Name", "")).strip()]
 
-
 # ---------- Audit log ----------
 
 def append_audit(action, transaction_id, detail, user_id):
@@ -178,7 +194,6 @@ def append_audit(action, transaction_id, detail, user_id):
         [_now(), action, transaction_id, detail, str(user_id)],
         value_input_option="USER_ENTERED",
     )
-
 
 # ---------- helpers ----------
 
@@ -240,6 +255,8 @@ def add_account(name, account_type, currency, starting_balance):
         value_input_option="USER_ENTERED",
     )
     return True
+
+
 def remove_client(name):
     """Remove a client by name. Returns False if not found."""
     ws = _ws(config.SHEET_CLIENTS)

@@ -2,11 +2,12 @@
 main.py
 The bot. Run this file to start ProsFolio AI.
 
-From the project folder:   python src/main.py
+From the project folder:   python main.py
 """
 
 import os
 import sys
+import time
 import logging
 
 # Let this file import its sibling modules (config, sheets, ...).
@@ -25,11 +26,26 @@ import rates
 config.check()
 
 os.makedirs("logs", exist_ok=True)
+
+# IMPORTANT: log to BOTH a local file and stdout. Railway's "Logs" tab only
+# captures stdout/stderr — if you only log to a file, everything after your
+# first print() (including pyTelegramBotAPI's own connection/retry messages
+# and any exception you catch) disappears from Railway's view even though the
+# bot is still doing something. This was the reason logs seemed to stop dead
+# after "ProsFolio AI is running."
 logging.basicConfig(
-    filename="logs/bot.log",
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
+    handlers=[
+        logging.FileHandler("logs/bot.log"),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
+
+# Make sure pyTelegramBotAPI's own internal logger (connection errors, 409
+# conflicts, retries) also flows through to the handlers above instead of
+# being silently dropped.
+telebot.logger.setLevel(logging.INFO)
 
 bot = telebot.TeleBot(config.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
 ALLOWED_ID = int(config.ALLOWED_TELEGRAM_USER_ID)
@@ -87,15 +103,18 @@ def cmd_help(m):
         "/report – this month's income, expenses, savings\n"
         "/undo – reverse the last transaction\n"
         "/setrate 58.9 – set the USD→PHP rate manually\n"
-        "/undo – reverse the last transaction\n\n"
+        "/rate – show current USD→PHP rate\n\n"
         "<b>➕ Add new items</b>\n"
         "/addclient Name – add a client\n"
         "/addsource Name – add an income source\n"
         "/addcategory Name – add an expense category\n"
         "/addaccount Name PHP 5000 – add an account\n\n"
+        "<b>➖ Remove items</b>\n"
+        "/removeclient Name\n"
+        "/removecategory Name\n"
+        "/removeaccount Name\n\n"
         "<b>📊 View lists</b>\n"
-        "/clients  /categories  /accounts\n"
-        "/rate – show current USD→PHP rate",
+        "/clients  /categories  /accounts",
     )
 
 
@@ -203,11 +222,13 @@ def handle_text(m):
     if not authorized(m):
         return
     if m.text.startswith("/"):
+        # Commands are handled by their own @bot.message_handler(commands=[...])
+        # functions above. Never let a "/" message fall through to the AI.
         return
     try:
         rate = rates.get_rate(sheets)
         text_lower = m.text.lower()
-        is_question = (any(t in text_lower for t in CHAT_TRIGGERS) or m.text.strip().endswith("?")) and not m.text.startswith("/")
+        is_question = any(t in text_lower for t in CHAT_TRIGGERS) or m.text.strip().endswith("?")
         if is_question:
             recent = sheets.get_recent_transactions(30)
             reply = parser.chat(m.text, context_for_ai(), rate, recent)
@@ -231,9 +252,10 @@ def handle_text(m):
             types.InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
         )
         bot.reply_to(m, summary, reply_markup=kb)
-    except Exception as e:
+    except Exception:
         logging.exception("handle_text failed")
         bot.reply_to(m, "Something went wrong. Try again!")
+
 
 @bot.callback_query_handler(func=lambda c: True)
 def handle_button(c):
@@ -246,15 +268,15 @@ def handle_button(c):
     if c.data == "cancel":
         pending.pop(uid, None)
         return bot.edit_message_text("❌ Cancelled. Nothing was saved.",
-                                     c.message.chat.id, c.message.message_id)
+                                      c.message.chat.id, c.message.message_id)
     if c.data == "edit":
         pending.pop(uid, None)
         return bot.edit_message_text("No problem — just send it again with the correction.",
-                                     c.message.chat.id, c.message.message_id)
+                                      c.message.chat.id, c.message.message_id)
     if c.data == "confirm":
         if not items:
             return bot.edit_message_text("That request expired. Please send it again.",
-                                         c.message.chat.id, c.message.message_id)
+                                          c.message.chat.id, c.message.message_id)
         try:
             results = [logic.apply(tx, uid) for tx in items]
             pending.pop(uid, None)
@@ -263,7 +285,6 @@ def handle_button(c):
         except Exception:
             logging.exception("confirm failed")
             bot.send_message(c.message.chat.id, "Couldn't save that — check logs/bot.log.")
-
 
 
 # ---------------- list views ----------------
@@ -397,7 +418,6 @@ def cmd_addaccount(m):
         bot.reply_to(m, f"<b>{name}</b> already exists in your accounts.")
 
 
-
 @bot.message_handler(commands=["removeclient"])
 def cmd_removeclient(m):
     if not authorized(m):
@@ -441,48 +461,29 @@ def cmd_removeaccount(m):
         bot.reply_to(m, f"✅ Account <b>{name}</b> removed.")
     else:
         bot.reply_to(m, f"❌ Account <b>{name}</b> not found. Check /accounts for the exact name.")
-def chat(message, context, rate, recent_tx):
-    """Handle conversational questions about finances."""
-    acct_lines = "\n".join(
-        f"- {a['name']} ({a['currency']}): {a['balance']}"
-        for a in context["accounts"]
-    )
-    tx_lines = "\n".join(
-        f"- {t.get('Transaction Date')} | {t.get('Type')} | "
-        f"{t.get('Currency')} {t.get('Amount')} | "
-        f"{t.get('Category')} | {t.get('Account')}"
-        for t in recent_tx[:20]
-    )
-    system = f"""You are ProsFolio AI, a friendly personal finance assistant for a Filipino freelancer. 
-You have access to their real financial data below. Answer their questions conversationally, 
-give honest advice, use Philippine context. Keep replies concise. Use ₱ for PHP amounts.
-You can speak Taglish if they do.
 
-USD→PHP rate: {rate}
 
-Account balances:
-{acct_lines}
+# ---------------- entry point ----------------
+# NOTE: this must be the LAST thing in the file — every handler above needs to
+# be registered with @bot before we start polling.
 
-Recent transactions:
-{tx_lines}
-
-Income sources: {", ".join(context["income_sources"])}
-Clients: {", ".join(context["clients"])}
-"""
-    try:
-        msg = _client.messages.create(
-            model=config.AI_MODEL,
-            max_tokens=600,
-            system=system,
-            messages=[{"role": "user", "content": message}],
-        )
-        return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
-    except Exception as e:
-        return f"Sorry, I couldn't process that right now. ({e})"
 if __name__ == "__main__":
-    print("ProsFolio AI is running. Press Ctrl+C to stop.")
+    print("ProsFolio AI is running. Press Ctrl+C to stop.", flush=True)
     logging.info("Bot started.")
-    bot.remove_webhook()
-    import time
+
+    # Clear any stuck webhook AND drop queued updates from a previous/overlapping
+    # instance. This is the main defense against the classic Railway redeploy
+    # overlap: the old container is still polling for a second or two while the
+    # new one boots, which is exactly what produces a 409 Conflict from Telegram.
+    bot.delete_webhook(drop_pending_updates=True)
     time.sleep(1)
-    bot.infinity_polling(timeout=30, long_polling_timeout=30, allowed_updates=[])
+
+    # Outer retry loop: if polling ever raises (network blip, 409 conflict that
+    # infinity_polling's own retry didn't absorb, etc.), log it somewhere visible
+    # and restart instead of letting the process die silently.
+    while True:
+        try:
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+        except Exception:
+            logging.exception("Polling crashed — restarting in 5 seconds.")
+            time.sleep(5)
