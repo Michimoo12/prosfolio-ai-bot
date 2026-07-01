@@ -68,3 +68,41 @@ def _extract_json(txt):
             except Exception:
                 pass
     return {"actions": [], "reply": "Sorry, I couldn't read that. Try rephrasing it."}
+def chat(message, context, rate, recent_tx):
+    """Handle conversational questions about finances."""
+    acct_lines = "\n".join(
+        f"- {a['name']} ({a['currency']}): {a['balance']}"
+        for a in context["accounts"]
+    )
+    tx_lines = "\n".join(
+        f"- {t.get('Transaction Date')} | {t.get('Type')} | "
+        f"{t.get('Currency')} {t.get('Amount')} | "
+        f"{t.get('Category')} | {t.get('Account')}"
+        for t in recent_tx[:20]
+    )
+    system = f"""You are ProsFolio AI, a friendly personal finance assistant for a Filipino freelancer. 
+You have access to their real financial data below. Answer their questions conversationally, 
+give honest advice, use Philippine context. Keep replies concise. Use ₱ for PHP amounts.
+You can speak Taglish if they do.
+
+USD→PHP rate: {rate}
+
+Account balances:
+{acct_lines}
+
+Recent transactions:
+{tx_lines}
+
+Income sources: {", ".join(context["income_sources"])}
+Clients: {", ".join(context["clients"])}
+"""
+    try:
+        msg = _client.messages.create(
+            model=config.AI_MODEL,
+            max_tokens=600,
+            system=system,
+            messages=[{"role": "user", "content": message}],
+        )
+        return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
+    except Exception as e:
+        return f"Sorry, I couldn't process that right now. ({e})"
