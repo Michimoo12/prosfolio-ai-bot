@@ -205,7 +205,7 @@ def handle_text(m):
     try:
         rate = rates.get_rate(sheets)
         text_lower = m.text.lower()
-        is_question = any(t in text_lower for t in CHAT_TRIGGERS) or m.text.strip().endswith("?")
+        is_question = (any(t in text_lower for t in CHAT_TRIGGERS) or m.text.strip().endswith("?")) and not m.text.startswith("/")
         if is_question:
             recent = sheets.get_recent_transactions(30)
             reply = parser.chat(m.text, context_for_ai(), rate, recent)
