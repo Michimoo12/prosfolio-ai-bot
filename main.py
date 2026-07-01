@@ -397,10 +397,7 @@ def cmd_addaccount(m):
         bot.reply_to(m, f"<b>{name}</b> already exists in your accounts.")
 
 
-if __name__ == "__main__":
-    print("ProsFolio AI is running. Press Ctrl+C to stop.")
-    logging.info("Bot started.")
-    bot.infinity_polling(timeout=30, long_polling_timeout=30)
+
 @bot.message_handler(commands=["removeclient"])
 def cmd_removeclient(m):
     if not authorized(m):
@@ -482,3 +479,10 @@ Clients: {", ".join(context["clients"])}
         return "".join(b.text for b in msg.content if getattr(b, "type", "") == "text")
     except Exception as e:
         return f"Sorry, I couldn't process that right now. ({e})"
+if __name__ == "__main__":
+    print("ProsFolio AI is running. Press Ctrl+C to stop.")
+    logging.info("Bot started.")
+    bot.remove_webhook()
+    import time
+    time.sleep(1)
+    bot.infinity_polling(timeout=30, long_polling_timeout=30, allowed_updates=[])
