@@ -389,3 +389,46 @@ if __name__ == "__main__":
     print("ProsFolio AI is running. Press Ctrl+C to stop.")
     logging.info("Bot started.")
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
+@bot.message_handler(commands=["removeclient"])
+def cmd_removeclient(m):
+    if not authorized(m):
+        return
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return bot.reply_to(m, "Usage: /removeclient ClientName\nExample: /removeclient TMGM")
+    name = parts[1].strip()
+    removed = sheets.remove_client(name)
+    if removed:
+        bot.reply_to(m, f"✅ Client <b>{name}</b> removed.")
+    else:
+        bot.reply_to(m, f"❌ Client <b>{name}</b> not found. Check /clients for the exact name.")
+
+
+@bot.message_handler(commands=["removecategory"])
+def cmd_removecategory(m):
+    if not authorized(m):
+        return
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return bot.reply_to(m, "Usage: /removecategory CategoryName\nExample: /removecategory Laundry")
+    name = parts[1].strip()
+    removed = sheets.remove_category(name)
+    if removed:
+        bot.reply_to(m, f"✅ Category <b>{name}</b> removed.")
+    else:
+        bot.reply_to(m, f"❌ <b>{name}</b> not found. Check /categories for the exact name.")
+
+
+@bot.message_handler(commands=["removeaccount"])
+def cmd_removeaccount(m):
+    if not authorized(m):
+        return
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return bot.reply_to(m, "Usage: /removeaccount AccountName\nExample: /removeaccount SeaBank")
+    name = parts[1].strip()
+    removed = sheets.remove_account(name)
+    if removed:
+        bot.reply_to(m, f"✅ Account <b>{name}</b> removed.")
+    else:
+        bot.reply_to(m, f"❌ Account <b>{name}</b> not found. Check /accounts for the exact name.")
