@@ -15,9 +15,11 @@ def peso(n):
 
 
 def money(amount, currency):
+    sign = "-" if amount < 0 else ""
+    amount = abs(amount)
     if currency == "USD":
-        return "$" + f"{amount:,.2f}"
-    return "₱" + f"{round(amount):,}"
+        return f"{sign}$" + f"{amount:,.2f}"
+    return f"{sign}₱" + f"{round(amount):,}"
 
 
 def _convert(amount, from_ccy, to_ccy, rate):
@@ -38,15 +40,20 @@ def validate(action, rate):
     """
     typ = (action.get("type") or "").lower()
     amount = action.get("amount")
-    if typ not in ("income", "expense", "transfer"):
-        return None, "Is that income, an expense, or a transfer?"
-    if amount is None or float(amount) <= 0:
+    if typ not in ("income", "expense", "transfer", "adjust_balance"):
+        return None, "Is that income, an expense, a transfer, or just telling me your current balance?"
+    if amount is None or float(amount) < 0:
         return None, "How much was it?"
     amount = float(amount)
+    if amount == 0 and typ != "adjust_balance":
+        return None, "How much was it?"
 
     currency = (action.get("currency") or "").upper()
     if currency not in ("PHP", "USD"):
         currency = "PHP" if typ == "expense" else ""
+
+    if typ == "adjust_balance":
+        return _build_adjustment(amount, currency, action, rate)
 
     if typ == "transfer":
         src = sheets.get_account(action.get("account") or "")
@@ -142,8 +149,60 @@ def _build_transfer(amount, currency, src, dst, rate, action):
     }
 
 
+def _build_adjustment(amount, currency, action, rate):
+    """
+    Handle "I have ₱2032 in GCash" / "my Maya balance is 500" style statements.
+    Unlike income/expense/transfer, `amount` here is the ACTUAL current
+    balance the user just told us — not a delta to apply. We diff it against
+    whatever the sheet currently has and log the difference as an adjustment
+    so there's still an audit trail, but the account ends up exactly at the
+    number the user stated.
+    """
+    acct = sheets.get_account(action.get("account") or "")
+    if not acct:
+        names = ", ".join(a["name"] for a in sheets.get_accounts())
+        return None, f"Which account is that balance for? ({names})"
+    if not currency:
+        currency = acct["currency"]
+
+    stated_balance = _convert(amount, currency, acct["currency"], rate)
+    delta = round(stated_balance - acct["balance"], 2)
+
+    tx = {
+        "Transaction ID": _new_id(),
+        "Created Timestamp": _now(),
+        "Transaction Date": action.get("date") or datetime.date.today().isoformat(),
+        "Type": "adjustment",
+        "Amount": delta,  # signed: how much this correction changes the balance by
+        "Currency": acct["currency"],
+        "Exchange Rate": rate,
+        "PHP Equivalent": round(_convert(delta, acct["currency"], "PHP", rate), 2),
+        "Category": "Balance Correction",
+        "Client": "",
+        "Income Source": "",
+        "Account": acct["name"],
+        "Destination Account": "",
+        "Description": action.get("description") or "Balance correction from chat",
+        "Telegram User ID": "",
+        "Status": "Active",
+        "_new_balance": round(stated_balance, 2),
+        "_old_balance": round(acct["balance"], 2),
+    }
+    return tx, None
+
+
 def confirm_text(tx):
     """The 'please confirm' summary shown before saving."""
+    if tx["Type"] == "adjustment":
+        old = money(tx["_old_balance"], tx["Currency"])
+        new = money(tx["_new_balance"], tx["Currency"])
+        return (
+            "<b>Please confirm this balance correction</b>\n"
+            f"Account: {tx['Account']}\n"
+            f"Current on record: {old}\n"
+            f"You said: {new}\n"
+            f"Date: {tx['Transaction Date']}"
+        )
     if tx["Type"] == "transfer":
         return (
             "<b>Please confirm this transfer</b>\n"
@@ -171,6 +230,18 @@ def confirm_text(tx):
 def apply(tx, user_id):
     """Write the transaction and update balances. Returns the 'recorded' message."""
     tx["Telegram User ID"] = str(user_id)
+
+    if tx["Type"] == "adjustment":
+        acct = sheets.get_account(tx["Account"])
+        new_bal = tx["_new_balance"]
+        sheets.update_account_balance(acct["name"], new_bal)
+        clean = {k: v for k, v in tx.items() if not k.startswith("_")}
+        sheets.append_transaction(clean)
+        sheets.append_audit("adjustment", tx["Transaction ID"], tx["Account"], user_id)
+        return (
+            "✅ <b>Balance updated</b>\n"
+            f"{acct['name']} is now {money(new_bal, acct['currency'])}"
+        )
 
     if tx["Type"] == "transfer":
         src = sheets.get_account(tx["Account"])
@@ -229,6 +300,14 @@ def _reverse(r, user_id):
     amount = float(r.get("Amount", 0) or 0)
     currency = r.get("Currency", "PHP") or "PHP"
     stored_rate = float(r.get("Exchange Rate", 1) or 1)
+    if typ == "adjustment":
+        acct = sheets.get_account(r.get("Account"))
+        # Amount is the signed delta the correction applied — undo by
+        # subtracting that same delta back out.
+        sheets.update_account_balance(acct["name"], acct["balance"] - amount)
+        sheets.mark_reversed(r.get("Transaction ID"))
+        sheets.append_audit("undo", r.get("Transaction ID"), "reversed by user", user_id)
+        return f"↩️ Undone: balance correction on {r.get('Account')}."
     if typ == "transfer":
         src = sheets.get_account(r.get("Account"))
         dst = sheets.get_account(r.get("Destination Account"))

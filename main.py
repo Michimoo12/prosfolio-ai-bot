@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import logging
+import functools
 
 # Let this file import its sibling modules (config, sheets, ...).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -58,6 +59,40 @@ def authorized(message):
     return message.from_user.id == ALLOWED_ID
 
 
+def guarded(handler):
+    """
+    Wrap a command handler so a failure actually replies to you instead of
+    vanishing into total silence.
+
+    Before this, every /command handler had NO error handling at all (only
+    the free-text handler did). If sheets.py, Google Sheets, or anything else
+    threw an exception inside a command — e.g. a permissions error on a
+    write — pyTelegramBotAPI would swallow it internally and you'd just never
+    get a reply, with nothing to go on. This makes every command behave like
+    handle_text already did: log the real exception (now visible in Railway
+    thanks to the stdout logging fix) AND tell you on Telegram that it
+    failed, instead of leaving you guessing whether the bot even saw your
+    message.
+    """
+    @functools.wraps(handler)
+    def wrapped(m, *args, **kwargs):
+        try:
+            return handler(m, *args, **kwargs)
+        except Exception:
+            logging.exception(f"{handler.__name__} failed")
+            try:
+                bot.reply_to(
+                    m,
+                    "⚠️ That command failed. Most likely cause: the Google Sheet "
+                    "isn't shared as Editor with your service account, or a tab/column "
+                    "name doesn't match. Check Railway's deploy logs for the exact error "
+                    "(search for \"Exception\" right after this message)."
+                )
+            except Exception:
+                pass
+    return wrapped
+
+
 def context_for_ai():
     expense, income, sources = sheets.get_categories()
     return {
@@ -72,6 +107,7 @@ def context_for_ai():
 # ---------------- commands ----------------
 
 @bot.message_handler(commands=["start"])
+@guarded
 def cmd_start(m):
     if not authorized(m):
         return bot.reply_to(m, "This bot is private.")
@@ -85,6 +121,7 @@ def cmd_start(m):
 
 
 @bot.message_handler(commands=["help"])
+@guarded
 def cmd_help(m):
     if not authorized(m):
         return
@@ -95,6 +132,9 @@ def cmd_help(m):
         "  “paid ₱1,625 for internet”\n"
         "  “received $300 from freelance”\n"
         "  “transfer ₱20,000 from UnionBank to Emergency Savings”\n\n"
+        "• Just telling me a real balance also works:\n"
+        "  “I have ₱2,032 in GCash”\n"
+        "  “GCash is now down to 400”\n\n"
         "• I'll show a summary and you tap <b>Confirm</b> before it's saved.\n\n"
         "<b>Commands</b>\n"
         "/balance – total + per-account balances\n"
@@ -102,6 +142,7 @@ def cmd_help(m):
         "/history – last 10 transactions\n"
         "/report – this month's income, expenses, savings\n"
         "/undo – reverse the last transaction\n"
+        "/setbalance GCash 2032 – correct an account balance directly\n"
         "/setrate 58.9 – set the USD→PHP rate manually\n"
         "/rate – show current USD→PHP rate\n\n"
         "<b>➕ Add new items</b>\n"
@@ -119,6 +160,7 @@ def cmd_help(m):
 
 
 @bot.message_handler(commands=["balance", "accounts"])
+@guarded
 def cmd_balance(m):
     if not authorized(m):
         return
@@ -134,6 +176,7 @@ def cmd_balance(m):
 
 
 @bot.message_handler(commands=["history"])
+@guarded
 def cmd_history(m):
     if not authorized(m):
         return
@@ -150,6 +193,7 @@ def cmd_history(m):
 
 
 @bot.message_handler(commands=["report"])
+@guarded
 def cmd_report(m):
     if not authorized(m):
         return
@@ -179,6 +223,7 @@ def cmd_report(m):
 
 
 @bot.message_handler(commands=["undo"])
+@guarded
 def cmd_undo(m):
     if not authorized(m):
         return
@@ -186,6 +231,7 @@ def cmd_undo(m):
 
 
 @bot.message_handler(commands=["rate"])
+@guarded
 def cmd_rate(m):
     if not authorized(m):
         return
@@ -193,6 +239,7 @@ def cmd_rate(m):
 
 
 @bot.message_handler(commands=["setrate"])
+@guarded
 def cmd_setrate(m):
     if not authorized(m):
         return
@@ -205,6 +252,43 @@ def cmd_setrate(m):
         return bot.reply_to(m, "That doesn't look like a number. Try: /setrate 58.90")
     rates.set_manual_rate(sheets, rate)
     bot.reply_to(m, f"Done. USD→PHP rate set to ₱{rate} (manual for today).")
+
+
+@bot.message_handler(commands=["setbalance"])
+@guarded
+def cmd_setbalance(m):
+    if not authorized(m):
+        return
+    # Usage: /setbalance AccountName Amount
+    # A guaranteed, no-AI way to correct an account's balance — use this if
+    # you ever say "I have X in Y" in plain chat and it doesn't stick.
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return bot.reply_to(m, "Usage: /setbalance AccountName Amount\nExample: /setbalance GCash 2032")
+    name = parts[1].strip()
+    acct = sheets.get_account(name)
+    if not acct:
+        names = ", ".join(a["name"] for a in sheets.get_accounts())
+        return bot.reply_to(m, f"Account not found. Your accounts: {names}")
+    try:
+        new_balance = float(parts[2].replace(",", "").replace("₱", "").replace("$", "").strip())
+    except ValueError:
+        return bot.reply_to(m, "That doesn't look like a number.")
+    rate = rates.get_rate(sheets)
+    tx, question = logic.validate(
+        {"type": "adjust_balance", "amount": new_balance, "currency": acct["currency"], "account": acct["name"]},
+        rate,
+    )
+    if question:
+        return bot.reply_to(m, question)
+    pending[m.from_user.id] = [tx]
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("✅ Confirm", callback_data="confirm"),
+        types.InlineKeyboardButton("✏️ Edit", callback_data="edit"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+    )
+    bot.reply_to(m, logic.confirm_text(tx), reply_markup=kb)
 
 
 # ---------------- natural language ----------------
@@ -290,6 +374,7 @@ def handle_button(c):
 # ---------------- list views ----------------
 
 @bot.message_handler(commands=["clients"])
+@guarded
 def cmd_clients(m):
     if not authorized(m):
         return
@@ -302,6 +387,7 @@ def cmd_clients(m):
 
 
 @bot.message_handler(commands=["categories"])
+@guarded
 def cmd_categories(m):
     if not authorized(m):
         return
@@ -315,6 +401,7 @@ def cmd_categories(m):
 # ---------------- add new items ----------------
 
 @bot.message_handler(commands=["addclient"])
+@guarded
 def cmd_addclient(m):
     if not authorized(m):
         return
@@ -341,6 +428,7 @@ def cmd_addclient(m):
 
 
 @bot.message_handler(commands=["addsource"])
+@guarded
 def cmd_addsource(m):
     if not authorized(m):
         return
@@ -363,6 +451,7 @@ def cmd_addsource(m):
 
 
 @bot.message_handler(commands=["addcategory"])
+@guarded
 def cmd_addcategory(m):
     if not authorized(m):
         return
@@ -386,6 +475,7 @@ def cmd_addcategory(m):
 
 
 @bot.message_handler(commands=["addaccount"])
+@guarded
 def cmd_addaccount(m):
     if not authorized(m):
         return
@@ -419,6 +509,7 @@ def cmd_addaccount(m):
 
 
 @bot.message_handler(commands=["removeclient"])
+@guarded
 def cmd_removeclient(m):
     if not authorized(m):
         return
@@ -434,6 +525,7 @@ def cmd_removeclient(m):
 
 
 @bot.message_handler(commands=["removecategory"])
+@guarded
 def cmd_removecategory(m):
     if not authorized(m):
         return
@@ -449,6 +541,7 @@ def cmd_removecategory(m):
 
 
 @bot.message_handler(commands=["removeaccount"])
+@guarded
 def cmd_removeaccount(m):
     if not authorized(m):
         return
