@@ -1,0 +1,7 @@
+pyTelegramBotAPI
+anthropic
+gspread
+google-auth
+python-dotenv
+pytz
+requests
