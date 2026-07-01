@@ -202,7 +202,7 @@ CHAT_TRIGGERS = [
 def handle_text(m):
     if not authorized(m):
         return
-        if m.text.startswith("/"):
+    if m.text.startswith("/"):
         return
     try:
         rate = rates.get_rate(sheets)
