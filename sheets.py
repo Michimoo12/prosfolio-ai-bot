@@ -240,3 +240,37 @@ def add_account(name, account_type, currency, starting_balance):
         value_input_option="USER_ENTERED",
     )
     return True
+def remove_client(name):
+    """Remove a client by name. Returns False if not found."""
+    ws = _ws(config.SHEET_CLIENTS)
+    header = ws.row_values(1)
+    name_col = header.index("Client Name") + 1
+    row = _row_for(ws, name_col, name)
+    if not row:
+        return False
+    ws.delete_rows(row)
+    return True
+
+
+def remove_category(name):
+    """Remove a category or income source by name. Returns False if not found."""
+    ws = _ws(config.SHEET_CATEGORIES)
+    header = ws.row_values(1)
+    name_col = header.index("Name") + 1
+    row = _row_for(ws, name_col, name)
+    if not row:
+        return False
+    ws.delete_rows(row)
+    return True
+
+
+def remove_account(name):
+    """Remove an account by name. Returns False if not found."""
+    ws = _ws(config.SHEET_ACCOUNTS)
+    header = ws.row_values(1)
+    name_col = header.index("Account Name") + 1
+    row = _row_for(ws, name_col, name)
+    if not row:
+        return False
+    ws.delete_rows(row)
+    return True
