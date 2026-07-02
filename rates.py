@@ -8,17 +8,22 @@ Order of preference:
  3. The fallback rate in your .env (only if the internet/service is down).
 """
 
+import threading
 import requests
 
 import config
 
 LIVE_URL = "https://open.er-api.com/v6/latest/USD"  # free, no API key required
 
+_refresh_lock = threading.Lock()
+
 
 def fetch_live_rate():
     """Return today's USD->PHP rate from the free service, or None if it fails."""
     try:
-        r = requests.get(LIVE_URL, timeout=10)
+        # Short timeout: this runs in the background under normal operation,
+        # but the very first run ever blocks a message on it.
+        r = requests.get(LIVE_URL, timeout=4)
         data = r.json()
         if data.get("result") == "success":
             php = data.get("rates", {}).get("PHP")
@@ -27,6 +32,29 @@ def fetch_live_rate():
     except Exception:
         pass
     return None
+
+
+def _refresh_async(sheets, today):
+    """
+    Refresh the daily rate WITHOUT blocking the current message. The first
+    message of the day used to stall for up to 10 seconds waiting on the FX
+    service; now that message uses yesterday's stored rate (off by well under
+    a percent) and the fresh rate is in place for the next one.
+    """
+    if not _refresh_lock.acquire(blocking=False):
+        return  # a refresh is already running
+
+    def work():
+        try:
+            live = fetch_live_rate()
+            if live:
+                sheets.set_setting("USD_TO_PHP_RATE", live)
+                sheets.set_setting("RATE_UPDATED", today)
+                sheets.set_setting("RATE_IS_MANUAL", "no")
+        finally:
+            _refresh_lock.release()
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 def get_rate(sheets):
@@ -48,17 +76,20 @@ def get_rate(sheets):
     if stored_date == today and stored_rate:
         return float(stored_rate)
 
-    # Otherwise refresh from the live source.
+    # Stale but usable: answer with it right away and refresh in the
+    # background so the NEXT message gets today's rate. (Blocking here was
+    # what froze the first message of every day.)
+    if stored_rate:
+        _refresh_async(sheets, today)
+        return float(stored_rate)
+
+    # Very first run ever (nothing stored yet) — fetch now, briefly blocking.
     live = fetch_live_rate()
     if live:
         sheets.set_setting("USD_TO_PHP_RATE", live)
         sheets.set_setting("RATE_UPDATED", today)
         sheets.set_setting("RATE_IS_MANUAL", "no")
         return live
-
-    # Live source failed — use whatever is stored, else the .env fallback.
-    if stored_rate:
-        return float(stored_rate)
     return config.DEFAULT_USD_TO_PHP_RATE
 
 

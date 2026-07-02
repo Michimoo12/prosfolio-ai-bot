@@ -39,6 +39,42 @@ def _drop_cache(*keys):
         _cache.pop(k, None)
 
 
+# The four small tabs the bot needs on almost every message. When any one of
+# them is cold, ONE values_batch_get fetches all four in a single HTTP round
+# trip (instead of four sequential get_all_records calls) — this is the main
+# reason cold messages got noticeably faster.
+
+def _records(vals):
+    """Raw batch values -> list of dicts, like get_all_records does."""
+    if not vals:
+        return []
+    headers = [str(h).strip() for h in vals[0]]
+    out = []
+    for row in vals[1:]:
+        row = list(row) + [""] * (len(headers) - len(row))
+        out.append(dict(zip(headers, row[:len(headers)])))
+    return out
+
+
+def _load_core():
+    keys = ["accounts", "categories", "clients", "settings"]
+    ranges = [config.SHEET_ACCOUNTS, config.SHEET_CATEGORIES,
+              config.SHEET_CLIENTS, config.SHEET_SETTINGS]
+    resp = _book().values_batch_get(ranges)
+    now = time.time()
+    for key, vr in zip(keys, resp.get("valueRanges", [])):
+        _cache[key] = (now, _records(vr.get("values", [])))
+
+
+def _core(key):
+    """Cached records for one of the four core tabs; one batch fetch if cold."""
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < _CACHE_TTL:
+        return hit[1]
+    _load_core()
+    return _cache[key][1]
+
+
 def _load_credentials_dict():
     """
     Parse GOOGLE_CREDENTIALS_JSON into a usable service-account dict.
@@ -89,7 +125,7 @@ def _row_for(ws, col_index, value):
 # ---------- Accounts ----------
 
 def get_accounts():
-    rows = _cached("accounts", lambda: _ws(config.SHEET_ACCOUNTS).get_all_records())
+    rows = _core("accounts")
     accounts = []
     for r in rows:
         name = str(r.get("Account Name", "")).strip()
@@ -123,8 +159,14 @@ def update_account_balance(name, new_balance):
     row = _row_for(ws, name_col, name)
     if not row:
         return
-    ws.update_cell(row, bal_col, round(new_balance, 2))
-    ws.update_cell(row, upd_col, _now())
+    # One batched write instead of two update_cell round trips. USER_ENTERED
+    # matches what update_cell did, so values parse the same as before.
+    from gspread.utils import rowcol_to_a1
+    ws.batch_update(
+        [{"range": rowcol_to_a1(row, bal_col), "values": [[round(new_balance, 2)]]},
+         {"range": rowcol_to_a1(row, upd_col), "values": [[_now()]]}],
+        value_input_option="USER_ENTERED",
+    )
     _drop_cache("accounts")
 
 # ---------- Transactions ----------
@@ -170,7 +212,7 @@ def mark_reversed(transaction_id):
 # ---------- Settings ----------
 
 def get_setting(key):
-    rows = _cached("settings", lambda: _ws(config.SHEET_SETTINGS).get_all_records())
+    rows = _core("settings")
     for r in rows:
         if str(r.get("Setting", "")).strip() == key:
             return str(r.get("Value", "")).strip()
@@ -192,7 +234,7 @@ def set_setting(key, value):
 # ---------- Lookup lists (for the AI) ----------
 
 def get_categories():
-    rows = _cached("categories", lambda: _ws(config.SHEET_CATEGORIES).get_all_records())
+    rows = _core("categories")
     expense, income, sources = [], [], []
     for r in rows:
         name = str(r.get("Name", "")).strip()
@@ -209,7 +251,7 @@ def get_categories():
 
 
 def get_clients():
-    rows = _cached("clients", lambda: _ws(config.SHEET_CLIENTS).get_all_records())
+    rows = _core("clients")
     return [str(r.get("Client Name", "")).strip()
             for r in rows if str(r.get("Client Name", "")).strip()]
 

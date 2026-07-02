@@ -6,6 +6,8 @@ math, updates balances, and writes to the sheet.
 
 import html
 import uuid
+import logging
+import threading
 
 import config
 import sheets
@@ -243,7 +245,7 @@ def apply(tx, user_id):
         sheets.update_account_balance(acct["name"], new_bal)
         clean = {k: v for k, v in tx.items() if not k.startswith("_")}
         sheets.append_transaction(clean)
-        sheets.append_audit("adjustment", tx["Transaction ID"], tx["Account"], user_id)
+        _audit_async("adjustment", tx["Transaction ID"], tx["Account"], user_id)
         return (
             "✅ <b>Balance updated</b>\n"
             f"{_esc(acct['name'])} is now {money(new_bal, acct['currency'])}"
@@ -258,8 +260,8 @@ def apply(tx, user_id):
         sheets.update_account_balance(dst["name"], new_dst)
         clean = {k: v for k, v in tx.items() if not k.startswith("_")}
         sheets.append_transaction(clean)
-        sheets.append_audit("transfer", tx["Transaction ID"],
-                            f"{tx['Account']} -> {tx['Destination Account']}", user_id)
+        _audit_async("transfer", tx["Transaction ID"],
+                     f"{tx['Account']} -> {tx['Destination Account']}", user_id)
         return (
             "✅ <b>Transfer recorded</b>\n"
             f"{money(tx['Amount'], tx['Currency'])}  {_esc(tx['Account'])} → {_esc(tx['Destination Account'])}\n"
@@ -279,7 +281,7 @@ def apply(tx, user_id):
     sheets.update_account_balance(acct["name"], new_bal)
     clean = {k: v for k, v in tx.items() if not k.startswith("_")}
     sheets.append_transaction(clean)
-    sheets.append_audit(tx["Type"], tx["Transaction ID"], tx["Account"], user_id)
+    _audit_async(tx["Type"], tx["Transaction ID"], tx["Account"], user_id)
 
     head = "✅ <b>Income recorded</b>" if tx["Type"] == "income" else "✅ <b>Expense recorded</b>"
     out = [head]
@@ -312,7 +314,7 @@ def _reverse(r, user_id):
         # subtracting that same delta back out.
         sheets.update_account_balance(acct["name"], acct["balance"] - amount)
         sheets.mark_reversed(r.get("Transaction ID"))
-        sheets.append_audit("undo", r.get("Transaction ID"), "reversed by user", user_id)
+        _audit_async("undo", r.get("Transaction ID"), "reversed by user", user_id)
         return f"↩️ Undone: balance correction on {_esc(str(r.get('Account')))}."
     if typ == "transfer":
         src = sheets.get_account(r.get("Account"))
@@ -329,8 +331,22 @@ def _reverse(r, user_id):
         delta = -acct_amount if typ == "income" else acct_amount  # opposite of original
         sheets.update_account_balance(acct["name"], acct["balance"] + delta)
     sheets.mark_reversed(r.get("Transaction ID"))
-    sheets.append_audit("undo", r.get("Transaction ID"), "reversed by user", user_id)
+    _audit_async("undo", r.get("Transaction ID"), "reversed by user", user_id)
     return f"↩️ Undone: {typ} {money(amount, currency)} on {_esc(str(r.get('Account')))}."
+
+
+def _audit_async(action, transaction_id, detail, user_id):
+    """
+    Write the audit row off the critical path. It's a convenience log — the
+    Transactions row (written synchronously above) is the source of truth —
+    so the user shouldn't wait an extra round trip to Google for it.
+    """
+    def work():
+        try:
+            sheets.append_audit(action, transaction_id, detail, user_id)
+        except Exception:
+            logging.exception("audit write failed (non-critical)")
+    threading.Thread(target=work, daemon=True).start()
 
 
 def _new_id():

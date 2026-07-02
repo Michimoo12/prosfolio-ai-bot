@@ -65,6 +65,18 @@ def authorized(message):
     return message.from_user.id == ALLOWED_ID
 
 
+def typing(chat_id):
+    """
+    Show "typing…" in Telegram while we work. The AI parse plus sheet reads
+    take a couple of seconds; without this the bot just looks dead until the
+    reply lands. Never allowed to break the actual handling.
+    """
+    try:
+        bot.send_chat_action(chat_id, "typing")
+    except Exception:
+        pass
+
+
 def guarded(handler):
     """
     Wrap a command handler so a failure actually replies to you instead of
@@ -506,6 +518,7 @@ def handle_text(m):
         # This handler is registered last, so a "/" message reaching it means
         # no real command matched. Say so instead of staying silent.
         return bot.reply_to(m, "Unknown command. Type /help to see everything I understand.")
+    typing(m.chat.id)
     try:
         rate = rates.get_rate(sheets)
         ctx = context_for_ai()
@@ -518,6 +531,7 @@ def handle_text(m):
         parsed = parser.parse(m.text, ctx, rate)
         actions = parsed.get("actions") or []
         if not actions:
+            typing(m.chat.id)  # second AI call ahead — keep the indicator alive
             recent = sheets.get_recent_transactions(30)
             return bot.reply_to(m, parser.chat(m.text, ctx, rate, recent))
 
@@ -565,6 +579,7 @@ def handle_button(c):
         if not items:
             return bot.edit_message_text("That request expired. Please send it again.",
                                           c.message.chat.id, c.message.message_id)
+        typing(c.message.chat.id)
         try:
             results = [logic.apply(tx, uid) for tx in items]
             bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
