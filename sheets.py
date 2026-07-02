@@ -8,11 +8,35 @@ is missing, you get a friendly message instead of a crash on startup.
 import os
 import json
 import time
+import threading
 import gspread
 
 import config
 
 _sh = None
+
+# ---------- every API call: one lock + quota retry ----------
+# Serialized: audit rows and the daily FX refresh run on background threads,
+# and the HTTP session underneath gspread is not thread-safe.
+# Retried: Google's free Sheets API allows 60 reads and 60 writes per minute
+# per user. A burst — like "set all my accounts to 0" confirming 9 balance
+# corrections at once — can trip that and come back as APIError 429. Backing
+# off inside the same minute-window turns "⚠️ failed" into "took a few
+# seconds longer."
+_api_lock = threading.RLock()
+_RETRY_DELAYS = [3, 8, 20]  # seconds between retries; quota window is 60s
+
+
+def _api(call):
+    with _api_lock:
+        for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+            if delay:
+                time.sleep(delay)
+            try:
+                return call()
+            except gspread.exceptions.APIError as e:
+                if getattr(e, "code", None) != 429 or attempt == len(_RETRY_DELAYS):
+                    raise
 
 # ---------- tiny read cache ----------
 # Every incoming message used to trigger several full-tab reads (accounts,
@@ -25,9 +49,10 @@ _cache = {}
 _CACHE_TTL = 20  # seconds
 
 
-def _cached(key, fetch):
+def _cached(key, fetch, ttl=None):
+    ttl = _CACHE_TTL if ttl is None else ttl
     hit = _cache.get(key)
-    if hit and time.time() - hit[0] < _CACHE_TTL:
+    if hit and time.time() - hit[0] < ttl:
         return hit[1]
     val = fetch()
     _cache[key] = (time.time(), val)
@@ -60,7 +85,7 @@ def _load_core():
     keys = ["accounts", "categories", "clients", "settings"]
     ranges = [config.SHEET_ACCOUNTS, config.SHEET_CATEGORIES,
               config.SHEET_CLIENTS, config.SHEET_SETTINGS]
-    resp = _book().values_batch_get(ranges)
+    resp = _api(lambda: _book().values_batch_get(ranges))
     now = time.time()
     for key, vr in zip(keys, resp.get("valueRanges", [])):
         _cache[key] = (now, _records(vr.get("values", [])))
@@ -113,9 +138,14 @@ def _ws(title):
     return _book().worksheet(title)
 
 
+def _header(ws):
+    """Header row of a tab, cached — headers don't change while the bot runs."""
+    return _cached("hdr:" + ws.title, lambda: _api(lambda: ws.row_values(1)), ttl=600)
+
+
 def _row_for(ws, col_index, value):
     """Return the 1-based row whose cell in `col_index` exactly equals `value`."""
-    vals = ws.col_values(col_index)
+    vals = _api(lambda: ws.col_values(col_index))
     target = str(value).strip().lower()
     for i, v in enumerate(vals, start=1):
         if str(v).strip().lower() == target:
@@ -152,7 +182,7 @@ def get_account(name):
 
 def update_account_balance(name, new_balance):
     ws = _ws(config.SHEET_ACCOUNTS)
-    header = ws.row_values(1)
+    header = _header(ws)
     name_col = header.index("Account Name") + 1
     bal_col = header.index("Current Balance") + 1
     upd_col = header.index("Last Updated") + 1
@@ -162,12 +192,21 @@ def update_account_balance(name, new_balance):
     # One batched write instead of two update_cell round trips. USER_ENTERED
     # matches what update_cell did, so values parse the same as before.
     from gspread.utils import rowcol_to_a1
-    ws.batch_update(
+    _api(lambda: ws.batch_update(
         [{"range": rowcol_to_a1(row, bal_col), "values": [[round(new_balance, 2)]]},
          {"range": rowcol_to_a1(row, upd_col), "values": [[_now()]]}],
         value_input_option="USER_ENTERED",
-    )
-    _drop_cache("accounts")
+    ))
+    # Patch the cached record in place instead of dropping the cache. A
+    # multi-account Confirm ("set all my accounts to 0") used to force a full
+    # re-read for every account, which is exactly what blew through Google's
+    # 60-reads-per-minute quota and produced APIError 429.
+    hit = _cache.get("accounts")
+    if hit:
+        target = str(name).strip().lower()
+        for r in hit[1]:
+            if str(r.get("Account Name", "")).strip().lower() == target:
+                r["Current Balance"] = round(new_balance, 2)
 
 # ---------- Transactions ----------
 
@@ -181,17 +220,17 @@ TX_HEADERS = [
 
 def append_transaction(tx):
     row = [tx.get(h, "") for h in TX_HEADERS]
-    _ws(config.SHEET_TRANSACTIONS).append_row(row, value_input_option="USER_ENTERED")
+    _api(lambda: _ws(config.SHEET_TRANSACTIONS).append_row(row, value_input_option="USER_ENTERED"))
     return tx.get("Transaction ID", "")
 
 
 def get_recent_transactions(n=10):
-    rows = _ws(config.SHEET_TRANSACTIONS).get_all_records()
+    rows = _api(lambda: _ws(config.SHEET_TRANSACTIONS).get_all_records())
     return rows[-n:][::-1]
 
 
 def get_month_transactions(year_month):
-    rows = _ws(config.SHEET_TRANSACTIONS).get_all_records()
+    rows = _api(lambda: _ws(config.SHEET_TRANSACTIONS).get_all_records())
     out = []
     for r in rows:
         d = str(r.get("Transaction Date", ""))
@@ -202,12 +241,12 @@ def get_month_transactions(year_month):
 
 def mark_reversed(transaction_id):
     ws = _ws(config.SHEET_TRANSACTIONS)
-    header = ws.row_values(1)
+    header = _header(ws)
     id_col = header.index("Transaction ID") + 1
     status_col = header.index("Status") + 1
     row = _row_for(ws, id_col, transaction_id)
     if row:
-        ws.update_cell(row, status_col, "Reversed")
+        _api(lambda: ws.update_cell(row, status_col, "Reversed"))
 
 # ---------- Settings ----------
 
@@ -221,14 +260,14 @@ def get_setting(key):
 
 def set_setting(key, value):
     ws = _ws(config.SHEET_SETTINGS)
-    header = ws.row_values(1)
+    header = _header(ws)
     key_col = header.index("Setting") + 1
     val_col = header.index("Value") + 1
     row = _row_for(ws, key_col, key)
     if row:
-        ws.update_cell(row, val_col, str(value))
+        _api(lambda: ws.update_cell(row, val_col, str(value)))
     else:
-        ws.append_row([key, str(value)], value_input_option="USER_ENTERED")
+        _api(lambda: ws.append_row([key, str(value)], value_input_option="USER_ENTERED"))
     _drop_cache("settings")
 
 # ---------- Lookup lists (for the AI) ----------
@@ -258,10 +297,10 @@ def get_clients():
 # ---------- Audit log ----------
 
 def append_audit(action, transaction_id, detail, user_id):
-    _ws(config.SHEET_AUDIT).append_row(
+    _api(lambda: _ws(config.SHEET_AUDIT).append_row(
         [_now(), action, transaction_id, detail, str(user_id)],
         value_input_option="USER_ENTERED",
-    )
+    ))
 
 # ---------- helpers ----------
 
@@ -282,10 +321,10 @@ def add_client(name, currency="USD", notes=""):
     existing = [c.lower() for c in get_clients()]
     if name.strip().lower() in existing:
         return False
-    _ws(config.SHEET_CLIENTS).append_row(
+    _api(lambda: _ws(config.SHEET_CLIENTS).append_row(
         [name.strip(), currency.upper(), notes],
         value_input_option="USER_ENTERED",
-    )
+    ))
     _drop_cache("clients")
     return True
 
@@ -295,10 +334,10 @@ def add_income_source(name):
     _, _, sources = get_categories()
     if name.strip().lower() in [s.lower() for s in sources]:
         return False
-    _ws(config.SHEET_CATEGORIES).append_row(
+    _api(lambda: _ws(config.SHEET_CATEGORIES).append_row(
         [name.strip(), "Income Source", ""],
         value_input_option="USER_ENTERED",
-    )
+    ))
     _drop_cache("categories")
     return True
 
@@ -308,10 +347,10 @@ def add_expense_category(name):
     expense, _, _ = get_categories()
     if name.strip().lower() in [e.lower() for e in expense]:
         return False
-    _ws(config.SHEET_CATEGORIES).append_row(
+    _api(lambda: _ws(config.SHEET_CATEGORIES).append_row(
         [name.strip(), "Expense Category", ""],
         value_input_option="USER_ENTERED",
-    )
+    ))
     _drop_cache("categories")
     return True
 
@@ -321,11 +360,11 @@ def add_account(name, account_type, currency, starting_balance):
     existing = [a["name"].lower() for a in get_accounts()]
     if name.strip().lower() in existing:
         return False
-    _ws(config.SHEET_ACCOUNTS).append_row(
+    _api(lambda: _ws(config.SHEET_ACCOUNTS).append_row(
         [name.strip(), account_type.strip(), currency.upper(),
          round(float(starting_balance), 2), round(float(starting_balance), 2), _now()],
         value_input_option="USER_ENTERED",
-    )
+    ))
     _drop_cache("accounts")
     return True
 
@@ -333,12 +372,12 @@ def add_account(name, account_type, currency, starting_balance):
 def remove_client(name):
     """Remove a client by name. Returns False if not found."""
     ws = _ws(config.SHEET_CLIENTS)
-    header = ws.row_values(1)
+    header = _header(ws)
     name_col = header.index("Client Name") + 1
     row = _row_for(ws, name_col, name)
     if not row:
         return False
-    ws.delete_rows(row)
+    _api(lambda: ws.delete_rows(row))
     _drop_cache("clients")
     return True
 
@@ -346,12 +385,12 @@ def remove_client(name):
 def remove_category(name):
     """Remove a category or income source by name. Returns False if not found."""
     ws = _ws(config.SHEET_CATEGORIES)
-    header = ws.row_values(1)
+    header = _header(ws)
     name_col = header.index("Name") + 1
     row = _row_for(ws, name_col, name)
     if not row:
         return False
-    ws.delete_rows(row)
+    _api(lambda: ws.delete_rows(row))
     _drop_cache("categories")
     return True
 
@@ -359,11 +398,11 @@ def remove_category(name):
 def remove_account(name):
     """Remove an account by name. Returns False if not found."""
     ws = _ws(config.SHEET_ACCOUNTS)
-    header = ws.row_values(1)
+    header = _header(ws)
     name_col = header.index("Account Name") + 1
     row = _row_for(ws, name_col, name)
     if not row:
         return False
-    ws.delete_rows(row)
+    _api(lambda: ws.delete_rows(row))
     _drop_cache("accounts")
     return True
