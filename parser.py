@@ -6,7 +6,6 @@ invents a missing amount, account, client, or currency.
 """
 
 import json
-import datetime
 from anthropic import Anthropic
 
 import config
@@ -75,7 +74,7 @@ Reply with ONLY a JSON object, no markdown, no backticks:
 
 
 def parse(text, context, rate):
-    today = datetime.date.today().isoformat()
+    today = config.today_iso()  # user's timezone, not the server's UTC date
     try:
         msg = _client.messages.create(
             model=config.AI_MODEL,

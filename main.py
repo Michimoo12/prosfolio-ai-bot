@@ -7,6 +7,7 @@ From the project folder:   python main.py
 
 import os
 import sys
+import html
 import time
 import logging
 import functools
@@ -53,6 +54,11 @@ ALLOWED_ID = int(config.ALLOWED_TELEGRAM_USER_ID)
 
 # Remembers the transaction(s) waiting for your Confirm tap. Keyed by user id.
 pending = {}
+
+# Escape user-typed names/notes before they go inside HTML replies. Without
+# this, an account called "R&B" or a note containing "<3" makes Telegram
+# reject the whole message (parse error) and the reply never arrives.
+esc = html.escape
 
 
 def authorized(message):
@@ -169,7 +175,7 @@ def cmd_balance(m):
     total_php = 0
     lines = ["<b>Balances</b>"]
     for a in accounts:
-        lines.append(f"{a['name']}: {logic.money(a['balance'], a['currency'])}")
+        lines.append(f"{esc(a['name'])}: {logic.money(a['balance'], a['currency'])}")
         total_php += a["balance"] * rate if a["currency"] == "USD" else a["balance"]
     lines.append(f"\n<b>Net worth:</b> {logic.peso(total_php)}  (at ₱{rate}/USD)")
     bot.reply_to(m, "\n".join(lines))
@@ -184,11 +190,14 @@ def cmd_history(m):
     if not rows:
         return bot.reply_to(m, "No transactions yet.")
     lines = ["<b>Recent</b>"]
+    signs = {"income": "+", "expense": "−", "adjustment": "±"}
     for r in rows:
-        sign = "+" if r.get("Type") == "income" else ("−" if r.get("Type") == "expense" else "↔")
-        amt = logic.money(float(r.get("Amount", 0) or 0), r.get("Currency", "PHP"))
+        sign = signs.get(str(r.get("Type", "")).lower(), "↔")
+        # _to_float instead of float(): the sheet can hand back "1,234.56" as
+        # a formatted string, which float() refuses.
+        amt = logic.money(sheets._to_float(r.get("Amount", 0)), r.get("Currency", "PHP"))
         tag = "  (reversed)" if str(r.get("Status", "")).lower() == "reversed" else ""
-        lines.append(f"{sign} {amt} · {r.get('Account')} · {r.get('Transaction Date')}{tag}")
+        lines.append(f"{sign} {amt} · {esc(str(r.get('Account') or ''))} · {r.get('Transaction Date')}{tag}")
     bot.reply_to(m, "\n".join(lines))
 
 
@@ -197,17 +206,18 @@ def cmd_history(m):
 def cmd_report(m):
     if not authorized(m):
         return
-    import datetime
-    ym = datetime.date.today().strftime("%Y-%m")
+    # config.now() is Manila time — datetime.date.today() on Railway is UTC,
+    # which put the first 8 hours of every month into the previous month.
+    ym = config.now().strftime("%Y-%m")
     rows = sheets.get_month_transactions(ym)
-    income = sum(float(r.get("PHP Equivalent", 0) or 0) for r in rows if r.get("Type") == "income")
-    expense = sum(float(r.get("PHP Equivalent", 0) or 0) for r in rows if r.get("Type") == "expense")
+    income = sum(sheets._to_float(r.get("PHP Equivalent", 0)) for r in rows if r.get("Type") == "income")
+    expense = sum(sheets._to_float(r.get("PHP Equivalent", 0)) for r in rows if r.get("Type") == "expense")
     net = income - expense
     rate_txt = f"{(net/income*100):.0f}%" if income > 0 else "—"
     cats = {}
     for r in rows:
         if r.get("Type") == "expense":
-            cats[r.get("Category")] = cats.get(r.get("Category"), 0) + float(r.get("PHP Equivalent", 0) or 0)
+            cats[r.get("Category")] = cats.get(r.get("Category"), 0) + sheets._to_float(r.get("PHP Equivalent", 0))
     top = sorted(cats.items(), key=lambda x: x[1], reverse=True)[:3]
     lines = [
         f"<b>This month ({ym})</b>",
@@ -218,7 +228,7 @@ def cmd_report(m):
     if top:
         lines.append("\nTop spending:")
         for c, v in top:
-            lines.append(f"  {c}: {logic.peso(v)}")
+            lines.append(f"  {esc(str(c))}: {logic.peso(v)}")
     bot.reply_to(m, "\n".join(lines))
 
 
@@ -269,7 +279,7 @@ def cmd_setbalance(m):
     acct = sheets.get_account(name)
     if not acct:
         names = ", ".join(a["name"] for a in sheets.get_accounts())
-        return bot.reply_to(m, f"Account not found. Your accounts: {names}")
+        return bot.reply_to(m, f"Account not found. Your accounts: {esc(names)}")
     try:
         new_balance = float(parts[2].replace(",", "").replace("₱", "").replace("$", "").strip())
     except ValueError:
@@ -289,86 +299,6 @@ def cmd_setbalance(m):
         types.InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
     )
     bot.reply_to(m, logic.confirm_text(tx), reply_markup=kb)
-
-
-# ---------------- natural language ----------------
-
-CHAT_TRIGGERS = [
-    "how much", "what's my", "compare", "am i", "advice",
-    "saving", "spent", "earned", "biggest", "most", "least",
-    "last month", "this month", "last year", "this year",
-    "summary", "total", "average", "trend", "suggest",
-    "magkano", "kumusta", "ano", "bakit", "paano",
-]
-
-@bot.message_handler(func=lambda m: True, content_types=["text"])
-def handle_text(m):
-    if not authorized(m):
-        return
-    if m.text.startswith("/"):
-        # Commands are handled by their own @bot.message_handler(commands=[...])
-        # functions above. Never let a "/" message fall through to the AI.
-        return
-    try:
-        rate = rates.get_rate(sheets)
-        text_lower = m.text.lower()
-        is_question = any(t in text_lower for t in CHAT_TRIGGERS) or m.text.strip().endswith("?")
-        if is_question:
-            recent = sheets.get_recent_transactions(30)
-            reply = parser.chat(m.text, context_for_ai(), rate, recent)
-            return bot.reply_to(m, reply)
-        parsed = parser.parse(m.text, context_for_ai(), rate)
-        actions = parsed.get("actions", [])
-        if not actions:
-            return bot.reply_to(m, parsed.get("reply") or "I couldn't read that — try rephrasing.")
-        built = []
-        for a in actions:
-            tx, question = logic.validate(a, rate)
-            if question:
-                return bot.reply_to(m, question)
-            built.append(tx)
-        pending[m.from_user.id] = built
-        summary = "\n\n".join(logic.confirm_text(tx) for tx in built)
-        kb = types.InlineKeyboardMarkup()
-        kb.row(
-            types.InlineKeyboardButton("✅ Confirm", callback_data="confirm"),
-            types.InlineKeyboardButton("✏️ Edit", callback_data="edit"),
-            types.InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
-        )
-        bot.reply_to(m, summary, reply_markup=kb)
-    except Exception:
-        logging.exception("handle_text failed")
-        bot.reply_to(m, "Something went wrong. Try again!")
-
-
-@bot.callback_query_handler(func=lambda c: True)
-def handle_button(c):
-    if c.from_user.id != ALLOWED_ID:
-        return
-    uid = c.from_user.id
-    items = pending.get(uid)
-    bot.answer_callback_query(c.id)
-
-    if c.data == "cancel":
-        pending.pop(uid, None)
-        return bot.edit_message_text("❌ Cancelled. Nothing was saved.",
-                                      c.message.chat.id, c.message.message_id)
-    if c.data == "edit":
-        pending.pop(uid, None)
-        return bot.edit_message_text("No problem — just send it again with the correction.",
-                                      c.message.chat.id, c.message.message_id)
-    if c.data == "confirm":
-        if not items:
-            return bot.edit_message_text("That request expired. Please send it again.",
-                                          c.message.chat.id, c.message.message_id)
-        try:
-            results = [logic.apply(tx, uid) for tx in items]
-            pending.pop(uid, None)
-            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
-            bot.send_message(c.message.chat.id, "\n\n".join(results))
-        except Exception:
-            logging.exception("confirm failed")
-            bot.send_message(c.message.chat.id, "Couldn't save that — check logs/bot.log.")
 
 
 # ---------------- list views ----------------
@@ -421,10 +351,10 @@ def cmd_addclient(m):
         currency = "USD"
     added = sheets.add_client(name, currency)
     if added:
-        bot.reply_to(m, f"✅ Client <b>{name}</b> ({currency}) added.\n"
-                        f"You can now say \"<i>{name} paid me $300</i>\" and I'll recognize it.")
+        bot.reply_to(m, f"✅ Client <b>{esc(name)}</b> ({currency}) added.\n"
+                        f"You can now say \"<i>{esc(name)} paid me $300</i>\" and I'll recognize it.")
     else:
-        bot.reply_to(m, f"<b>{name}</b> already exists in your clients list.")
+        bot.reply_to(m, f"<b>{esc(name)}</b> already exists in your clients list.")
 
 
 @bot.message_handler(commands=["addsource"])
@@ -444,10 +374,10 @@ def cmd_addsource(m):
     name = parts[1].strip()
     added = sheets.add_income_source(name)
     if added:
-        bot.reply_to(m, f"✅ Income source <b>{name}</b> added.\n"
-                        f"You can now say \"<i>received $200 from {name}</i>\" and I'll recognize it.")
+        bot.reply_to(m, f"✅ Income source <b>{esc(name)}</b> added.\n"
+                        f"You can now say \"<i>received $200 from {esc(name)}</i>\" and I'll recognize it.")
     else:
-        bot.reply_to(m, f"<b>{name}</b> already exists as an income source.")
+        bot.reply_to(m, f"<b>{esc(name)}</b> already exists as an income source.")
 
 
 @bot.message_handler(commands=["addcategory"])
@@ -468,10 +398,10 @@ def cmd_addcategory(m):
     name = parts[1].strip()
     added = sheets.add_expense_category(name)
     if added:
-        bot.reply_to(m, f"✅ Expense category <b>{name}</b> added.\n"
-                        f"You can now say \"<i>spent ₱500 on {name}</i>\" and I'll categorize it correctly.")
+        bot.reply_to(m, f"✅ Expense category <b>{esc(name)}</b> added.\n"
+                        f"You can now say \"<i>spent ₱500 on {esc(name)}</i>\" and I'll categorize it correctly.")
     else:
-        bot.reply_to(m, f"<b>{name}</b> already exists as an expense category.")
+        bot.reply_to(m, f"<b>{esc(name)}</b> already exists as an expense category.")
 
 
 @bot.message_handler(commands=["addaccount"])
@@ -502,10 +432,10 @@ def cmd_addaccount(m):
     added = sheets.add_account(name, "bank", currency, balance)
     if added:
         bal_str = logic.money(balance, currency)
-        bot.reply_to(m, f"✅ Account <b>{name}</b> ({currency}, {bal_str}) added.\n"
-                        f"You can now say \"<i>spent ₱200 using {name}</i>\" and I'll update it.")
+        bot.reply_to(m, f"✅ Account <b>{esc(name)}</b> ({currency}, {bal_str}) added.\n"
+                        f"You can now say \"<i>spent ₱200 using {esc(name)}</i>\" and I'll update it.")
     else:
-        bot.reply_to(m, f"<b>{name}</b> already exists in your accounts.")
+        bot.reply_to(m, f"<b>{esc(name)}</b> already exists in your accounts.")
 
 
 @bot.message_handler(commands=["removeclient"])
@@ -519,9 +449,9 @@ def cmd_removeclient(m):
     name = parts[1].strip()
     removed = sheets.remove_client(name)
     if removed:
-        bot.reply_to(m, f"✅ Client <b>{name}</b> removed.")
+        bot.reply_to(m, f"✅ Client <b>{esc(name)}</b> removed.")
     else:
-        bot.reply_to(m, f"❌ Client <b>{name}</b> not found. Check /clients for the exact name.")
+        bot.reply_to(m, f"❌ Client <b>{esc(name)}</b> not found. Check /clients for the exact name.")
 
 
 @bot.message_handler(commands=["removecategory"])
@@ -535,9 +465,9 @@ def cmd_removecategory(m):
     name = parts[1].strip()
     removed = sheets.remove_category(name)
     if removed:
-        bot.reply_to(m, f"✅ Category <b>{name}</b> removed.")
+        bot.reply_to(m, f"✅ Category <b>{esc(name)}</b> removed.")
     else:
-        bot.reply_to(m, f"❌ <b>{name}</b> not found. Check /categories for the exact name.")
+        bot.reply_to(m, f"❌ <b>{esc(name)}</b> not found. Check /categories for the exact name.")
 
 
 @bot.message_handler(commands=["removeaccount"])
@@ -551,9 +481,99 @@ def cmd_removeaccount(m):
     name = parts[1].strip()
     removed = sheets.remove_account(name)
     if removed:
-        bot.reply_to(m, f"✅ Account <b>{name}</b> removed.")
+        bot.reply_to(m, f"✅ Account <b>{esc(name)}</b> removed.")
     else:
-        bot.reply_to(m, f"❌ Account <b>{name}</b> not found. Check /accounts for the exact name.")
+        bot.reply_to(m, f"❌ Account <b>{esc(name)}</b> not found. Check /accounts for the exact name.")
+
+
+# ---------------- natural language ----------------
+#
+# ⚠️ REGISTRATION ORDER IS LOAD-BEARING. pyTelegramBotAPI dispatches each
+# message to the FIRST registered handler whose filters match, and
+# handle_text's filter (func=lambda m: True) matches EVERYTHING — including
+# /commands. It must therefore be registered AFTER every command handler.
+# When it sat in the middle of this file, every command defined below it
+# (/addaccount, /addclient, /clients, /remove..., etc.) was unreachable:
+# handle_text swallowed them and returned silently, which looked exactly like
+# "the bot is randomly not responding." If you add a new /command, add it
+# ABOVE this section.
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def handle_text(m):
+    if not authorized(m):
+        return
+    if m.text.startswith("/"):
+        # This handler is registered last, so a "/" message reaching it means
+        # no real command matched. Say so instead of staying silent.
+        return bot.reply_to(m, "Unknown command. Type /help to see everything I understand.")
+    try:
+        rate = rates.get_rate(sheets)
+        ctx = context_for_ai()
+
+        # Let the NLU decide whether this is something to LOG. Keyword lists
+        # are too blunt for routing: the old CHAT_TRIGGERS list contained
+        # "spent", so "spent 700 on skincare" was answered as a question and
+        # never logged. Now: parse first; if there's nothing to log, answer
+        # it as a question with real data.
+        parsed = parser.parse(m.text, ctx, rate)
+        actions = parsed.get("actions") or []
+        if not actions:
+            recent = sheets.get_recent_transactions(30)
+            return bot.reply_to(m, parser.chat(m.text, ctx, rate, recent))
+
+        built = []
+        for a in actions:
+            tx, question = logic.validate(a, rate)
+            if question:
+                return bot.reply_to(m, question)
+            built.append(tx)
+        pending[m.from_user.id] = built
+        summary = "\n\n".join(logic.confirm_text(tx) for tx in built)
+        kb = types.InlineKeyboardMarkup()
+        kb.row(
+            types.InlineKeyboardButton("✅ Confirm", callback_data="confirm"),
+            types.InlineKeyboardButton("✏️ Edit", callback_data="edit"),
+            types.InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+        )
+        bot.reply_to(m, summary, reply_markup=kb)
+    except Exception:
+        logging.exception("handle_text failed")
+        bot.reply_to(m, "Something went wrong. Try again!")
+
+
+@bot.callback_query_handler(func=lambda c: True)
+def handle_button(c):
+    if c.from_user.id != ALLOWED_ID:
+        return
+    uid = c.from_user.id
+    bot.answer_callback_query(c.id)
+
+    if c.data == "cancel":
+        pending.pop(uid, None)
+        return bot.edit_message_text("❌ Cancelled. Nothing was saved.",
+                                      c.message.chat.id, c.message.message_id)
+    if c.data == "edit":
+        pending.pop(uid, None)
+        return bot.edit_message_text("No problem — just send it again with the correction.",
+                                      c.message.chat.id, c.message.message_id)
+    if c.data == "confirm":
+        # Pop BEFORE applying. TeleBot runs handlers on worker threads, so a
+        # double-tap on Confirm used to deliver two callbacks that could both
+        # see the same pending items and save the transaction twice. Popping
+        # first makes the second tap harmlessly hit "expired."
+        items = pending.pop(uid, None)
+        if not items:
+            return bot.edit_message_text("That request expired. Please send it again.",
+                                          c.message.chat.id, c.message.message_id)
+        try:
+            results = [logic.apply(tx, uid) for tx in items]
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
+            bot.send_message(c.message.chat.id, "\n\n".join(results))
+        except Exception:
+            logging.exception("confirm failed")
+            bot.send_message(c.message.chat.id,
+                             "⚠️ Couldn't save that. Check /history before retrying — "
+                             "part of it may have been saved. (Details are in the deploy logs.)")
 
 
 # ---------------- entry point ----------------

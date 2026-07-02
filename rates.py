@@ -8,7 +8,6 @@ Order of preference:
  3. The fallback rate in your .env (only if the internet/service is down).
 """
 
-import datetime
 import requests
 
 import config
@@ -35,7 +34,7 @@ def get_rate(sheets):
     Return the rate to use right now, refreshing from the live source once a day.
     `sheets` is the module that reads/writes the Settings tab.
     """
-    today = datetime.date.today().isoformat()
+    today = config.today_iso()  # Manila date, not the server's UTC date
 
     stored_rate = sheets.get_setting("USD_TO_PHP_RATE")
     stored_date = sheets.get_setting("RATE_UPDATED")
@@ -65,7 +64,7 @@ def get_rate(sheets):
 
 def set_manual_rate(sheets, rate):
     """Save a manual rate from /setrate."""
-    today = datetime.date.today().isoformat()
+    today = config.today_iso()
     sheets.set_setting("USD_TO_PHP_RATE", round(float(rate), 4))
     sheets.set_setting("RATE_UPDATED", today)
     sheets.set_setting("RATE_IS_MANUAL", "yes")

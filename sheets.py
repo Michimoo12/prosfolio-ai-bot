@@ -7,12 +7,36 @@ is missing, you get a friendly message instead of a crash on startup.
 
 import os
 import json
-import datetime
+import time
 import gspread
 
 import config
 
 _sh = None
+
+# ---------- tiny read cache ----------
+# Every incoming message used to trigger several full-tab reads (accounts,
+# categories, clients, settings — some more than once). Each is a separate
+# HTTP round trip to Google, which made replies sluggish and eats into the
+# Sheets API's 60-reads-per-minute quota. Reads are cached for a few seconds;
+# every write in this module drops the affected key, so nothing the bot
+# changes is ever served stale.
+_cache = {}
+_CACHE_TTL = 20  # seconds
+
+
+def _cached(key, fetch):
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < _CACHE_TTL:
+        return hit[1]
+    val = fetch()
+    _cache[key] = (time.time(), val)
+    return val
+
+
+def _drop_cache(*keys):
+    for k in keys:
+        _cache.pop(k, None)
 
 
 def _load_credentials_dict():
@@ -65,7 +89,7 @@ def _row_for(ws, col_index, value):
 # ---------- Accounts ----------
 
 def get_accounts():
-    rows = _ws(config.SHEET_ACCOUNTS).get_all_records()
+    rows = _cached("accounts", lambda: _ws(config.SHEET_ACCOUNTS).get_all_records())
     accounts = []
     for r in rows:
         name = str(r.get("Account Name", "")).strip()
@@ -101,6 +125,7 @@ def update_account_balance(name, new_balance):
         return
     ws.update_cell(row, bal_col, round(new_balance, 2))
     ws.update_cell(row, upd_col, _now())
+    _drop_cache("accounts")
 
 # ---------- Transactions ----------
 
@@ -145,7 +170,7 @@ def mark_reversed(transaction_id):
 # ---------- Settings ----------
 
 def get_setting(key):
-    rows = _ws(config.SHEET_SETTINGS).get_all_records()
+    rows = _cached("settings", lambda: _ws(config.SHEET_SETTINGS).get_all_records())
     for r in rows:
         if str(r.get("Setting", "")).strip() == key:
             return str(r.get("Value", "")).strip()
@@ -162,11 +187,12 @@ def set_setting(key, value):
         ws.update_cell(row, val_col, str(value))
     else:
         ws.append_row([key, str(value)], value_input_option="USER_ENTERED")
+    _drop_cache("settings")
 
 # ---------- Lookup lists (for the AI) ----------
 
 def get_categories():
-    rows = _ws(config.SHEET_CATEGORIES).get_all_records()
+    rows = _cached("categories", lambda: _ws(config.SHEET_CATEGORIES).get_all_records())
     expense, income, sources = [], [], []
     for r in rows:
         name = str(r.get("Name", "")).strip()
@@ -183,7 +209,7 @@ def get_categories():
 
 
 def get_clients():
-    rows = _ws(config.SHEET_CLIENTS).get_all_records()
+    rows = _cached("clients", lambda: _ws(config.SHEET_CLIENTS).get_all_records())
     return [str(r.get("Client Name", "")).strip()
             for r in rows if str(r.get("Client Name", "")).strip()]
 
@@ -198,7 +224,8 @@ def append_audit(action, transaction_id, detail, user_id):
 # ---------- helpers ----------
 
 def _now():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Manila wall-clock time, not the server's UTC (see config.now()).
+    return config.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _to_float(v):
@@ -217,6 +244,7 @@ def add_client(name, currency="USD", notes=""):
         [name.strip(), currency.upper(), notes],
         value_input_option="USER_ENTERED",
     )
+    _drop_cache("clients")
     return True
 
 
@@ -229,6 +257,7 @@ def add_income_source(name):
         [name.strip(), "Income Source", ""],
         value_input_option="USER_ENTERED",
     )
+    _drop_cache("categories")
     return True
 
 
@@ -241,6 +270,7 @@ def add_expense_category(name):
         [name.strip(), "Expense Category", ""],
         value_input_option="USER_ENTERED",
     )
+    _drop_cache("categories")
     return True
 
 
@@ -254,6 +284,7 @@ def add_account(name, account_type, currency, starting_balance):
          round(float(starting_balance), 2), round(float(starting_balance), 2), _now()],
         value_input_option="USER_ENTERED",
     )
+    _drop_cache("accounts")
     return True
 
 
@@ -266,6 +297,7 @@ def remove_client(name):
     if not row:
         return False
     ws.delete_rows(row)
+    _drop_cache("clients")
     return True
 
 
@@ -278,6 +310,7 @@ def remove_category(name):
     if not row:
         return False
     ws.delete_rows(row)
+    _drop_cache("categories")
     return True
 
 
@@ -290,4 +323,5 @@ def remove_account(name):
     if not row:
         return False
     ws.delete_rows(row)
+    _drop_cache("accounts")
     return True

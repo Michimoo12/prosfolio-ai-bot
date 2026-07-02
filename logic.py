@@ -4,10 +4,16 @@ The trustworthy part. Python (not the AI) validates each action, does all the
 math, updates balances, and writes to the sheet.
 """
 
+import html
 import uuid
-import datetime
 
+import config
 import sheets
+
+# Free-text fields (account/category/client names, etc.) get interpolated
+# into HTML-mode Telegram messages — escape them or names containing
+# & / < / > make Telegram reject the whole reply.
+_esc = html.escape
 
 
 def peso(n):
@@ -72,7 +78,7 @@ def validate(action, rate):
     acct = sheets.get_account(action.get("account") or "")
     if not acct:
         names = ", ".join(a["name"] for a in sheets.get_accounts())
-        return None, f"Which account? ({names})"
+        return None, f"Which account? ({_esc(names)})"
     if not currency:
         if typ == "income":
             return None, "Was that in pesos (₱) or dollars ($)?"
@@ -99,7 +105,7 @@ def validate(action, rate):
     tx = {
         "Transaction ID": _new_id(),
         "Created Timestamp": _now(),
-        "Transaction Date": action.get("date") or datetime.date.today().isoformat(),
+        "Transaction Date": action.get("date") or config.today_iso(),
         "Type": typ,
         "Amount": round(amount, 2),
         "Currency": currency,
@@ -128,7 +134,7 @@ def _build_transfer(amount, currency, src, dst, rate, action):
     return {
         "Transaction ID": _new_id(),
         "Created Timestamp": _now(),
-        "Transaction Date": action.get("date") or datetime.date.today().isoformat(),
+        "Transaction Date": action.get("date") or config.today_iso(),
         "Type": "transfer",
         "Amount": round(amount, 2),
         "Currency": currency,
@@ -161,7 +167,7 @@ def _build_adjustment(amount, currency, action, rate):
     acct = sheets.get_account(action.get("account") or "")
     if not acct:
         names = ", ".join(a["name"] for a in sheets.get_accounts())
-        return None, f"Which account is that balance for? ({names})"
+        return None, f"Which account is that balance for? ({_esc(names)})"
     if not currency:
         currency = acct["currency"]
 
@@ -171,7 +177,7 @@ def _build_adjustment(amount, currency, action, rate):
     tx = {
         "Transaction ID": _new_id(),
         "Created Timestamp": _now(),
-        "Transaction Date": action.get("date") or datetime.date.today().isoformat(),
+        "Transaction Date": action.get("date") or config.today_iso(),
         "Type": "adjustment",
         "Amount": delta,  # signed: how much this correction changes the balance by
         "Currency": acct["currency"],
@@ -198,7 +204,7 @@ def confirm_text(tx):
         new = money(tx["_new_balance"], tx["Currency"])
         return (
             "<b>Please confirm this balance correction</b>\n"
-            f"Account: {tx['Account']}\n"
+            f"Account: {_esc(tx['Account'])}\n"
             f"Current on record: {old}\n"
             f"You said: {new}\n"
             f"Date: {tx['Transaction Date']}"
@@ -207,8 +213,8 @@ def confirm_text(tx):
         return (
             "<b>Please confirm this transfer</b>\n"
             f"Amount: {money(tx['Amount'], tx['Currency'])}\n"
-            f"From: {tx['Account']}\n"
-            f"To: {tx['Destination Account']}\n"
+            f"From: {_esc(tx['Account'])}\n"
+            f"To: {_esc(tx['Destination Account'])}\n"
             f"Date: {tx['Transaction Date']}"
         )
     label = "income" if tx["Type"] == "income" else "expense"
@@ -217,12 +223,12 @@ def confirm_text(tx):
         lines.append(f"Amount: {money(tx['Amount'],'USD')} → {peso(tx['PHP Equivalent'])} (₱{tx['Exchange Rate']}/USD)")
     else:
         lines.append(f"Amount: {peso(tx['Amount'])}")
-    lines.append(f"Category: {tx['Category']}")
+    lines.append(f"Category: {_esc(tx['Category'])}")
     if tx["Income Source"]:
-        lines.append(f"Source: {tx['Income Source']}")
+        lines.append(f"Source: {_esc(tx['Income Source'])}")
     if tx["Client"]:
-        lines.append(f"Client: {tx['Client']}")
-    lines.append(f"Account: {tx['Account']}")
+        lines.append(f"Client: {_esc(tx['Client'])}")
+    lines.append(f"Account: {_esc(tx['Account'])}")
     lines.append(f"Date: {tx['Transaction Date']}")
     return "\n".join(lines)
 
@@ -240,7 +246,7 @@ def apply(tx, user_id):
         sheets.append_audit("adjustment", tx["Transaction ID"], tx["Account"], user_id)
         return (
             "✅ <b>Balance updated</b>\n"
-            f"{acct['name']} is now {money(new_bal, acct['currency'])}"
+            f"{_esc(acct['name'])} is now {money(new_bal, acct['currency'])}"
         )
 
     if tx["Type"] == "transfer":
@@ -256,9 +262,9 @@ def apply(tx, user_id):
                             f"{tx['Account']} -> {tx['Destination Account']}", user_id)
         return (
             "✅ <b>Transfer recorded</b>\n"
-            f"{money(tx['Amount'], tx['Currency'])}  {tx['Account']} → {tx['Destination Account']}\n"
-            f"New {src['name']} balance: {money(new_src, src['currency'])}\n"
-            f"New {dst['name']} balance: {money(new_dst, dst['currency'])}\n"
+            f"{money(tx['Amount'], tx['Currency'])}  {_esc(tx['Account'])} → {_esc(tx['Destination Account'])}\n"
+            f"New {_esc(src['name'])} balance: {money(new_src, src['currency'])}\n"
+            f"New {_esc(dst['name'])} balance: {money(new_dst, dst['currency'])}\n"
             "<i>Net worth unchanged</i>"
         )
 
@@ -281,8 +287,8 @@ def apply(tx, user_id):
         out.append(f"Amount: {money(tx['Amount'],'USD')} → {peso(tx['PHP Equivalent'])}")
     else:
         out.append(f"Amount: {peso(tx['Amount'])}")
-    out.append(f"Category: {tx['Category']}  ·  Account: {acct['name']}")
-    out.append(f"New {acct['name']} balance: {money(new_bal, acct['currency'])}")
+    out.append(f"Category: {_esc(tx['Category'])}  ·  Account: {_esc(acct['name'])}")
+    out.append(f"New {_esc(acct['name'])} balance: {money(new_bal, acct['currency'])}")
     return "\n".join(out)
 
 
@@ -307,7 +313,7 @@ def _reverse(r, user_id):
         sheets.update_account_balance(acct["name"], acct["balance"] - amount)
         sheets.mark_reversed(r.get("Transaction ID"))
         sheets.append_audit("undo", r.get("Transaction ID"), "reversed by user", user_id)
-        return f"↩️ Undone: balance correction on {r.get('Account')}."
+        return f"↩️ Undone: balance correction on {_esc(str(r.get('Account')))}."
     if typ == "transfer":
         src = sheets.get_account(r.get("Account"))
         dst = sheets.get_account(r.get("Destination Account"))
@@ -324,7 +330,7 @@ def _reverse(r, user_id):
         sheets.update_account_balance(acct["name"], acct["balance"] + delta)
     sheets.mark_reversed(r.get("Transaction ID"))
     sheets.append_audit("undo", r.get("Transaction ID"), "reversed by user", user_id)
-    return f"↩️ Undone: {typ} {money(amount, currency)} on {r.get('Account')}."
+    return f"↩️ Undone: {typ} {money(amount, currency)} on {_esc(str(r.get('Account')))}."
 
 
 def _new_id():
@@ -332,4 +338,5 @@ def _new_id():
 
 
 def _now():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Manila wall-clock time, not the server's UTC (see config.now()).
+    return config.now().strftime("%Y-%m-%d %H:%M:%S")
