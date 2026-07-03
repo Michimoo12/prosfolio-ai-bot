@@ -287,7 +287,12 @@ TX_HEADERS = [
 
 def append_transaction(tx):
     row = [tx.get(h, "") for h in TX_HEADERS]
-    _api(lambda: _ws(config.SHEET_TRANSACTIONS).append_row(row, value_input_option="USER_ENTERED"))
+    # table_range="A1" anchors Google's table detection at A1. Without it,
+    # a blank first row made the API "detect" a fresh table after each
+    # append, so every new transaction landed one step further RIGHT —
+    # a diagonal staircase of data hundreds of columns wide.
+    _api(lambda: _ws(config.SHEET_TRANSACTIONS).append_row(
+        row, value_input_option="USER_ENTERED", table_range="A1"))
     return tx.get("Transaction ID", "")
 
 
@@ -399,8 +404,41 @@ def get_clients():
 def append_audit(action, transaction_id, detail, user_id):
     _api(lambda: _ws(config.SHEET_AUDIT).append_row(
         [_now(), action, transaction_id, detail, str(user_id)],
-        value_input_option="USER_ENTERED",
+        value_input_option="USER_ENTERED", table_range="A1",
     ))
+
+
+# ---------- one-time repair for the diagonal-staircase Transactions tab ----------
+
+def load_raw_transactions():
+    """
+    Extract every transaction from the raw grid, wherever it sits. Each row's
+    record is the 16 cells starting at its "TX-..." id — rows written during
+    the staircase era have that id far to the right. Returns (records,
+    misaligned_count).
+    """
+    vals = _api(lambda: _ws(config.SHEET_TRANSACTIONS).get_values())
+    txs, misaligned = [], 0
+    for row in vals:
+        for j, c in enumerate(row):
+            if str(c).strip().upper().startswith("TX-"):
+                rec = [str(x) for x in row[j:j + 16]]
+                rec += [""] * (16 - len(rec))
+                txs.append(rec)
+                if j > 0:
+                    misaligned += 1
+                break
+    return txs, misaligned
+
+
+def rebuild_transactions(txs):
+    """Clear the Transactions tab and rewrite it: headers on row 1, every
+    transaction aligned at column A."""
+    ws = _ws(config.SHEET_TRANSACTIONS)
+    _api(lambda: ws.clear())
+    _api(lambda: ws.update([list(TX_HEADERS)] + [list(t) for t in txs],
+                           "A1", value_input_option="USER_ENTERED"))
+    _drop_cache("hdr:" + ws.title)
 
 # ---------- helpers ----------
 
@@ -423,7 +461,7 @@ def add_client(name, currency="USD", notes=""):
         return False
     _api(lambda: _ws(config.SHEET_CLIENTS).append_row(
         [name.strip(), currency.upper(), notes],
-        value_input_option="USER_ENTERED",
+        value_input_option="USER_ENTERED", table_range="A1",
     ))
     _drop_cache("clients")
     return True
@@ -436,7 +474,7 @@ def add_income_source(name):
         return False
     _api(lambda: _ws(config.SHEET_CATEGORIES).append_row(
         [name.strip(), "Income Source", ""],
-        value_input_option="USER_ENTERED",
+        value_input_option="USER_ENTERED", table_range="A1",
     ))
     _drop_cache("categories")
     return True
@@ -449,7 +487,7 @@ def add_expense_category(name):
         return False
     _api(lambda: _ws(config.SHEET_CATEGORIES).append_row(
         [name.strip(), "Expense Category", ""],
-        value_input_option="USER_ENTERED",
+        value_input_option="USER_ENTERED", table_range="A1",
     ))
     _drop_cache("categories")
     return True
@@ -463,7 +501,7 @@ def add_account(name, account_type, currency, starting_balance):
     _api(lambda: _ws(config.SHEET_ACCOUNTS).append_row(
         [name.strip(), account_type.strip(), currency.upper(),
          round(float(starting_balance), 2), round(float(starting_balance), 2), _now()],
-        value_input_option="USER_ENTERED",
+        value_input_option="USER_ENTERED", table_range="A1",
     ))
     _drop_cache("accounts")
     return True

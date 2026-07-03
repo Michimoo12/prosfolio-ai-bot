@@ -59,6 +59,8 @@ pending = {}
 saving = set()
 # Waiting /delete confirmations: uid -> Transaction ID.
 pending_delete = {}
+# Users with a /fixsheet rebuild awaiting confirmation.
+pending_fix = set()
 # The Transaction IDs shown by the user's last /history, in display order,
 # so "/delete 2" can resolve the number to a real transaction.
 hist_map = {}
@@ -358,6 +360,38 @@ def cmd_undo(m):
     if not authorized(m):
         return
     bot.reply_to(m, logic.undo_last(m.from_user.id))
+
+
+@bot.message_handler(commands=["fixsheet"])
+@guarded
+def cmd_fixsheet(m):
+    if not authorized(m):
+        return
+    # One-time repair: earlier appends wrote transactions in a diagonal
+    # staircase across hundreds of columns. This rebuilds the Transactions
+    # tab with headers on row 1 and every row aligned at column A.
+    typing(m.chat.id)
+    txs, misaligned = sheets.load_raw_transactions()
+    if not txs:
+        return bot.reply_to(m, "No transactions found to rebuild.")
+    if not misaligned:
+        return bot.reply_to(m, f"Your Transactions tab already looks clean "
+                               f"({len(txs)} rows, all aligned) — nothing to fix. 🎉")
+    pending_fix.add(m.from_user.id)
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🔧 Rebuild", callback_data="fixconfirm"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+    )
+    bot.reply_to(
+        m,
+        f"<b>Rebuild the Transactions tab?</b>\n"
+        f"Found {len(txs)} transactions — {misaligned} of them are misaligned "
+        f"(written diagonally across far columns by an old bug).\n\n"
+        f"This rewrites the tab: headers on row 1, every transaction aligned, "
+        f"junk columns gone. Balances aren't touched.",
+        reply_markup=kb,
+    )
 
 
 @bot.message_handler(commands=["delete"])
@@ -745,8 +779,43 @@ def handle_button(c):
     if c.data == "cancel":
         pending.pop(uid, None)
         pending_delete.pop(uid, None)
+        pending_fix.discard(uid)
         return bot.edit_message_text("❌ Cancelled. Nothing was saved.",
                                       c.message.chat.id, c.message.message_id)
+
+    if c.data == "fixconfirm":
+        if uid in saving:
+            return
+        if uid not in pending_fix:
+            try:
+                bot.edit_message_text("That request expired. Please send /fixsheet again.",
+                                      c.message.chat.id, c.message.message_id)
+            except Exception:
+                pass
+            return
+        pending_fix.discard(uid)
+        saving.add(uid)
+        typing(c.message.chat.id)
+        try:
+            # Re-extract at confirm time so nothing logged in between is lost.
+            txs, misaligned = sheets.load_raw_transactions()
+            sheets.rebuild_transactions(txs)
+        except Exception:
+            logging.exception("fixsheet failed")
+            return bot.send_message(c.message.chat.id,
+                                    "⚠️ Rebuild failed — nothing may have changed. "
+                                    "Check the deploy logs and your sheet before retrying.")
+        finally:
+            saving.discard(uid)
+        try:
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return bot.send_message(
+            c.message.chat.id,
+            f"🔧 <b>Rebuilt.</b> {len(txs)} transactions aligned "
+            f"({misaligned} were rescued from the diagonal). "
+            f"Try /transactions — everything should be there now.")
 
     if c.data == "delconfirm":
         if uid in saving:
