@@ -28,6 +28,13 @@ TIMEZONE = os.getenv("TIMEZONE", "Asia/Manila").strip()
 # The model used to read your messages. Haiku is the cheapest and is great at this.
 AI_MODEL = "claude-haiku-4-5-20251001"
 
+# Accounts whose "Account Type" (in the Accounts tab) is one of these are
+# treated as NOT spendable: /balance shows them under a separate locked
+# section and the AI won't count them as money you can spend. Edit the
+# Account Type cell in your sheet to e.g. "savings", "investment" or
+# "crypto" to lock an account.
+ILLIQUID_ACCOUNT_TYPES = {"savings", "investment", "crypto", "locked", "illiquid"}
+
 
 def now():
     """

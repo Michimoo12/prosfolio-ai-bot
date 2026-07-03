@@ -95,10 +95,16 @@ def _records(vals):
         return []
     out = []
     for row in vals[hdr_idx + 1:]:
+        # Truncate to the header width BEFORE the blank check: rows whose
+        # only content sits in stray columns beyond the headers used to
+        # come back as ghost records with every real field empty — they
+        # showed up in /history as "↔ ₱0 · ·" and pushed real transactions
+        # off the list.
+        row = list(row)[:len(headers)]
         if not any(str(c).strip() for c in row):
             continue
-        row = list(row) + [""] * (len(headers) - len(row))
-        out.append(dict(zip(headers, row[:len(headers)])))
+        row = row + [""] * (len(headers) - len(row))
+        out.append(dict(zip(headers, row)))
     return out
 
 
@@ -290,10 +296,11 @@ def _transactions():
     All transaction rows as dicts. Uses raw values + _records() instead of
     gspread's get_all_records(), which refuses to read the tab at all if any
     row has stray content beyond the 16 header columns ("header row contains
-    duplicates: ['']"). _records() just ignores anything beyond the headers,
-    so one stray cell can't take down /history, /report, /undo and chat.
+    duplicates: ['']"). _records() ignores anything beyond the headers, and
+    only rows with a Transaction ID count as transactions.
     """
-    return _records(_api(lambda: _ws(config.SHEET_TRANSACTIONS).get_values()))
+    rows = _records(_api(lambda: _ws(config.SHEET_TRANSACTIONS).get_values()))
+    return [r for r in rows if str(r.get("Transaction ID", "")).strip()]
 
 
 def get_recent_transactions(n=10):

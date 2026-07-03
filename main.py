@@ -210,6 +210,10 @@ def cmd_help(m):
     )
 
 
+def _is_liquid(a):
+    return str(a.get("type", "")).strip().lower() not in config.ILLIQUID_ACCOUNT_TYPES
+
+
 @bot.message_handler(commands=["balance", "accounts"])
 @guarded
 def cmd_balance(m):
@@ -217,12 +221,25 @@ def cmd_balance(m):
         return
     rate = rates.get_rate(sheets)
     accounts = sheets.get_accounts()
-    total_php = 0
+    liquid = [a for a in accounts if _is_liquid(a)]
+    locked = [a for a in accounts if not _is_liquid(a)]
+
+    def php(a):
+        return a["balance"] * rate if a["currency"] == "USD" else a["balance"]
+
     lines = ["<b>Balances</b>"]
-    for a in accounts:
-        lines.append(f"{esc(a['name'])}: {logic.money(a['balance'], a['currency'])}")
-        total_php += a["balance"] * rate if a["currency"] == "USD" else a["balance"]
-    lines.append(f"\n<b>Net worth:</b> {logic.peso(total_php)}  (at ₱{rate}/USD)")
+    if liquid:
+        lines.append("\n💧 <b>Spendable</b>")
+        for a in liquid:
+            lines.append(f"{esc(a['name'])}: {logic.money(a['balance'], a['currency'])}")
+    if locked:
+        lines.append("\n🔒 <b>Savings & locked — not for spending</b>")
+        for a in locked:
+            lines.append(f"{esc(a['name'])}: {logic.money(a['balance'], a['currency'])}")
+    spend_php = sum(php(a) for a in liquid)
+    total_php = spend_php + sum(php(a) for a in locked)
+    lines.append(f"\n<b>Spendable:</b> {logic.peso(spend_php)}")
+    lines.append(f"<b>Net worth:</b> {logic.peso(total_php)}  (at ₱{rate}/USD)")
     bot.reply_to(m, "\n".join(lines))
 
 
@@ -500,17 +517,19 @@ def cmd_addcategory(m):
 def cmd_addaccount(m):
     if not authorized(m):
         return
-    # Usage: /addaccount AccountName [PHP|USD] [balance]
-    # Example: /addaccount SeaBank PHP 5000
-    parts = m.text.split(maxsplit=3)
+    # Usage: /addaccount AccountName [PHP|USD] [balance] [type]
+    # Example: /addaccount SeaBank PHP 5000 savings
+    parts = m.text.split(maxsplit=4)
     if len(parts) < 2:
         return bot.reply_to(
             m,
-            "Usage: /addaccount AccountName [PHP or USD] [starting balance]\n"
+            "Usage: /addaccount AccountName [PHP or USD] [starting balance] [type]\n"
             "Examples:\n"
             "  /addaccount SeaBank PHP 5000\n"
-            "  /addaccount Kraken USD 0\n\n"
-            "Currency defaults to PHP, starting balance defaults to 0."
+            "  /addaccount Kraken USD 0 crypto\n\n"
+            "Currency defaults to PHP, balance to 0, type to bank.\n"
+            "Types savings / investment / crypto / locked are treated as NOT "
+            "spendable in /balance."
         )
     name = parts[1].strip()
     currency = parts[2].strip().upper() if len(parts) > 2 else "PHP"
@@ -520,7 +539,8 @@ def cmd_addaccount(m):
         balance = float(parts[3].replace(",", "")) if len(parts) > 3 else 0.0
     except ValueError:
         balance = 0.0
-    added = sheets.add_account(name, "bank", currency, balance)
+    acct_type = parts[4].strip().lower() if len(parts) > 4 else "bank"
+    added = sheets.add_account(name, acct_type, currency, balance)
     if added:
         bal_str = logic.money(balance, currency)
         bot.reply_to(m, f"✅ Account <b>{esc(name)}</b> ({currency}, {bal_str}) added.\n"

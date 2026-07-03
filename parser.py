@@ -13,8 +13,15 @@ import config
 _client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
 
+def _liquidity_mark(a):
+    illiquid = str(a.get("type", "")).strip().lower() in config.ILLIQUID_ACCOUNT_TYPES
+    return "  [savings/locked — NOT spendable]" if illiquid else ""
+
+
 def _system_prompt(context, rate, today):
-    accts = "\n".join(f"- {a['name']} ({a['currency']}): currently {a['balance']}" for a in context["accounts"])
+    accts = "\n".join(
+        f"- {a['name']} ({a['currency']}): currently {a['balance']}{_liquidity_mark(a)}"
+        for a in context["accounts"])
     return f"""You read short money messages (English or Taglish) for a Filipino freelancer and turn them into structured ledger actions.
 
 Today is {today}. The USD->PHP rate is {rate}.
@@ -109,7 +116,7 @@ def _extract_json(txt):
 def chat(message, context, rate, recent_tx):
     """Handle conversational questions about finances."""
     acct_lines = "\n".join(
-        f"- {a['name']} ({a['currency']}): {a['balance']}"
+        f"- {a['name']} ({a['currency']}): {a['balance']}{_liquidity_mark(a)}"
         for a in context["accounts"]
     )
     tx_lines = "\n".join(
@@ -141,6 +148,13 @@ WHAT THIS BOT ACTUALLY DOES — be accurate about this, it matters:
   question, just tell them to say it plainly and it'll get logged — don't fabricate uncertainty
   about whether that's possible.
 - Don't add unsolicited "here's what I can/can't do" disclaimers. Answer the actual question.
+
+MONEY THE USER CAN ACTUALLY SPEND:
+- Accounts marked [savings/locked — NOT spendable] are savings, investments or
+  locked funds. When asked "how much money do I have", "can I afford X", or
+  anything about available money, lead with the SPENDABLE total (unmarked
+  accounts only) and mention locked money separately. Never present locked
+  balances as money that's free to spend.
 
 USD→PHP rate: {rate}
 
