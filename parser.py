@@ -58,6 +58,7 @@ Examples (illustrative only — match the intent, not exact wording):
 - "spent 1640 sa GCash for internet bill" -> [{{"type":"expense","account":"GCash","amount":1640,"currency":"PHP","category":"Internet"}}]
 - "GCash is now just 400" -> [{{"type":"adjust_balance","account":"GCash","amount":400,"currency":"PHP"}}]
 - "Arcadia paid me $450 for TMGM" -> [{{"type":"income","client":"TMGM","income_source":"Arcadia","amount":450,"currency":"USD"}}]
+- "on July 2 again i spent 970 for my laundry using unionbank" -> [{{"type":"expense","account":"UnionBank","amount":970,"currency":"PHP","category":"Other","date":"{today[:4]}-07-02"}}]
 - "transfer 1000 from UnionBank to Emergency Savings" -> [{{"type":"transfer","account":"UnionBank","destination_account":"Emergency Savings","amount":1000,"currency":"PHP"}}]
 
 Rules:
@@ -65,6 +66,9 @@ Rules:
 - "$" / "dollars" / "usd" -> currency USD. "₱" / "php" / "pesos" -> currency PHP. "k" means thousands (20k = 20000).
 - If an expense has an amount but no currency symbol, assume currency PHP (pesos are the default for spending).
 - Match fuzzy account names to the closest real account above (e.g. "maya"->Maya, "union"->UnionBank, "emergency"->Emergency Savings, "rcbc dollar"->RCBC USD). If you genuinely cannot tell which account, leave account null.
+- CRITICAL: phrases like "using X", "with X", "via X", "gamit X", "sa X" name the ACCOUNT. If X matches an account above, you MUST fill account with it — never leave account null when the message literally names one. "spent 970 for laundry using unionbank" -> account "UnionBank".
+- If the message names a day ("July 2", "on the 15th", "yesterday"/"kahapon"), resolve it to YYYY-MM-DD relative to today, picking the most recent such date (never a future one). Otherwise date = today.
+- A list of several purchases in one message (one per line) = one action per line, each with its own amount, category, and date; anything stated once at the top ("using UnionBank") applies to every line.
 - For income, fill income_source and/or client only if the message clearly names them.
 - A message may contain several actions; return all of them.
 - If the user is just chatting/asking a question rather than logging or stating anything financial, return an empty actions list and put a helpful response in "reply".

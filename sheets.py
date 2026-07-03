@@ -173,11 +173,38 @@ def get_accounts():
     return accounts
 
 
+def _squash(s):
+    return "".join(ch for ch in str(s).lower() if ch.isalnum())
+
+
 def get_account(name):
-    for a in get_accounts():
-        if a["name"].lower() == str(name).strip().lower():
+    """
+    Find an account forgivingly: exact match first, then ignoring spaces and
+    punctuation ("union bank" -> UnionBank), then unique containment
+    ("UnionBank Account" -> UnionBank). Ambiguous queries ("rcbc" when both
+    RCBC PHP and RCBC USD exist) return None so the bot asks instead of
+    guessing with money.
+    """
+    accounts = get_accounts()
+    q = str(name).strip().lower()
+    if not q:
+        return None
+    for a in accounts:
+        if a["name"].lower() == q:
             return a
-    return None
+    qs = _squash(q)
+    if not qs:
+        return None
+    for a in accounts:
+        if _squash(a["name"]) == qs:
+            return a
+    hits = [a for a in accounts if _squash(a["name"]) in qs or qs in _squash(a["name"])]
+    # Drop hits whose name sits inside another hit's name (e.g. "Cash" inside
+    # "GCash") so they don't create false ambiguity.
+    squashes = [_squash(a["name"]) for a in hits]
+    hits = [a for a in hits
+            if not any(_squash(a["name"]) != s and _squash(a["name"]) in s for s in squashes)]
+    return hits[0] if len(hits) == 1 else None
 
 
 def update_account_balance(name, new_balance):

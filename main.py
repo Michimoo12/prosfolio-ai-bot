@@ -6,6 +6,7 @@ From the project folder:   python main.py
 """
 
 import os
+import re
 import sys
 import html
 import time
@@ -56,6 +57,30 @@ ALLOWED_ID = int(config.ALLOWED_TELEGRAM_USER_ID)
 pending = {}
 # User ids whose Confirm is currently being saved (guards double-taps).
 saving = set()
+# Per-user memory of the last message that parsed into actions but was
+# missing something (we asked e.g. "Which account?"). A short reply like
+# "unionbank" used to be parsed from scratch, lose all context, and get
+# answered with a balance lookup. Now the reply is combined with the stored
+# message and re-parsed, so answering the question completes the original
+# transaction. uid -> (text, timestamp)
+followup = {}
+FOLLOWUP_TTL = 600  # seconds
+
+
+def account_mentioned(text):
+    """
+    If EXACTLY ONE known account name literally appears in the text, return
+    it. Deterministic safety net for when the AI misses an explicit
+    "... using unionbank" — Python, not the model, gets the final say.
+    Word-bounded so "using gcash" can never also count as "Cash".
+    """
+    found = []
+    low = str(text).lower()
+    for a in sheets.get_accounts():
+        pat = r"\b" + re.escape(a["name"].lower()).replace(r"\ ", r"\s+") + r"\b"
+        if re.search(pat, low):
+            found.append(a["name"])
+    return found[0] if len(found) == 1 else None
 
 # Escape user-typed names/notes before they go inside HTML replies. Without
 # this, an account called "R&B" or a note containing "<3" makes Telegram
@@ -522,6 +547,7 @@ def handle_text(m):
         return bot.reply_to(m, "Unknown command. Type /help to see everything I understand.")
     typing(m.chat.id)
     try:
+        uid = m.from_user.id
         rate = rates.get_rate(sheets)
         ctx = context_for_ai()
 
@@ -530,20 +556,46 @@ def handle_text(m):
         # "spent", so "spent 700 on skincare" was answered as a question and
         # never logged. Now: parse first; if there's nothing to log, answer
         # it as a question with real data.
-        parsed = parser.parse(m.text, ctx, rate)
+        effective = m.text
+        parsed = parser.parse(effective, ctx, rate)
         actions = parsed.get("actions") or []
+
         if not actions:
-            typing(m.chat.id)  # second AI call ahead — keep the indicator alive
-            recent = sheets.get_recent_transactions(30)
-            return bot.reply_to(m, parser.chat(m.text, ctx, rate, recent))
+            # Nothing to log on its own. If we just asked this user a
+            # question ("Which account?"), treat this message as the ANSWER:
+            # re-parse it together with the stored original message.
+            prev = followup.get(uid)
+            if prev and time.time() - prev[1] < FOLLOWUP_TTL:
+                typing(m.chat.id)
+                effective = prev[0] + "\n(Follow-up answer from the user: " + m.text + ")"
+                parsed = parser.parse(effective, ctx, rate)
+                actions = parsed.get("actions") or []
+            if not actions:
+                typing(m.chat.id)  # second AI call ahead — keep the indicator alive
+                recent = sheets.get_recent_transactions(30)
+                return bot.reply_to(m, parser.chat(m.text, ctx, rate, recent))
+
+        followup.pop(uid, None)
+
+        # Deterministic account fallback: if the user literally named exactly
+        # one account in the message but the AI left `account` empty or
+        # unmatchable, trust the message text.
+        mention = account_mentioned(effective)
+        if mention:
+            for a in actions:
+                if a.get("type") != "transfer" and not sheets.get_account(a.get("account") or ""):
+                    a["account"] = mention
 
         built = []
         for a in actions:
             tx, question = logic.validate(a, rate)
             if question:
+                # Remember what we were working on so the user's next short
+                # reply ("unionbank", "970", "$") can complete it.
+                followup[uid] = (effective, time.time())
                 return bot.reply_to(m, question)
             built.append(tx)
-        pending[m.from_user.id] = built
+        pending[uid] = built
         summary = "\n\n".join(logic.confirm_text(tx) for tx in built)
         kb = types.InlineKeyboardMarkup()
         kb.row(
