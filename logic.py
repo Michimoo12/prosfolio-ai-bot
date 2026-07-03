@@ -303,38 +303,72 @@ def undo_last(user_id):
     return "Nothing to undo."
 
 
-def _reverse(r, user_id):
+def _undo_balance_effect(r):
+    """
+    Apply the INVERSE balance effect of transaction row `r`. Shared by /undo
+    (which then marks the row Reversed) and /delete (which then removes the
+    row entirely). Uses _to_float because rows read back from the sheet can
+    carry formatted strings like "1,234.56", and the exchange rate stored at
+    transaction time so USD math reverses exactly.
+    """
     typ = str(r.get("Type", "")).lower()
-    # _to_float, not float(): rows read back from the sheet can carry
-    # formatted strings like "1,234.56" or "₱-4,000".
     amount = sheets._to_float(r.get("Amount", 0))
     currency = r.get("Currency", "PHP") or "PHP"
     stored_rate = sheets._to_float(r.get("Exchange Rate", 1)) or 1
     if typ == "adjustment":
+        # Amount is the signed delta the correction applied — subtract it.
         acct = sheets.get_account(r.get("Account"))
-        # Amount is the signed delta the correction applied — undo by
-        # subtracting that same delta back out.
-        sheets.update_account_balance(acct["name"], acct["balance"] - amount)
-        sheets.mark_reversed(r.get("Transaction ID"))
-        _audit_async("undo", r.get("Transaction ID"), "reversed by user", user_id)
-        return f"↩️ Undone: balance correction on {_esc(str(r.get('Account')))}."
-    if typ == "transfer":
+        if acct:
+            sheets.update_account_balance(acct["name"], acct["balance"] - amount)
+    elif typ == "transfer":
         src = sheets.get_account(r.get("Account"))
         dst = sheets.get_account(r.get("Destination Account"))
-        out_amount = _convert(amount, currency, src["currency"], stored_rate)
-        in_amount = _convert(amount, currency, dst["currency"], stored_rate)
-        sheets.update_account_balance(src["name"], src["balance"] + out_amount)
-        sheets.update_account_balance(dst["name"], dst["balance"] - in_amount)
+        if src:
+            out_amount = _convert(amount, currency, src["currency"], stored_rate)
+            sheets.update_account_balance(src["name"], src["balance"] + out_amount)
+        if dst:
+            in_amount = _convert(amount, currency, dst["currency"], stored_rate)
+            sheets.update_account_balance(dst["name"], dst["balance"] - in_amount)
     else:
         acct = sheets.get_account(r.get("Account"))
-        # Same fix as apply(): convert into the account's own currency before
-        # touching its balance, using the rate that was in effect at the time.
-        acct_amount = _convert(amount, currency, acct["currency"], stored_rate)
-        delta = -acct_amount if typ == "income" else acct_amount  # opposite of original
-        sheets.update_account_balance(acct["name"], acct["balance"] + delta)
+        if acct:
+            acct_amount = _convert(amount, currency, acct["currency"], stored_rate)
+            delta = -acct_amount if typ == "income" else acct_amount
+            sheets.update_account_balance(acct["name"], acct["balance"] + delta)
+    return typ, amount, currency
+
+
+def _reverse(r, user_id):
+    typ, amount, currency = _undo_balance_effect(r)
     sheets.mark_reversed(r.get("Transaction ID"))
     _audit_async("undo", r.get("Transaction ID"), "reversed by user", user_id)
+    if typ == "adjustment":
+        return f"↩️ Undone: balance correction on {_esc(str(r.get('Account')))}."
     return f"↩️ Undone: {typ} {money(amount, currency)} on {_esc(str(r.get('Account')))}."
+
+
+def delete_transaction(tx_id, user_id):
+    """
+    Permanently remove one transaction: reverse its balance effect (only if
+    it's still Active — Reversed rows already gave the money back) and
+    delete its row from the sheet.
+    """
+    r = sheets.find_transaction(tx_id)
+    if not r:
+        return f"Couldn't find {_esc(str(tx_id))}. Run /history and use the number it shows."
+    was_active = str(r.get("Status", "")).lower() == "active"
+    if was_active:
+        typ, amount, currency = _undo_balance_effect(r)
+    else:
+        typ = str(r.get("Type", "")).lower() or "transaction"
+        amount = sheets._to_float(r.get("Amount", 0))
+        currency = r.get("Currency", "PHP") or "PHP"
+    if not sheets.delete_transaction_row(tx_id):
+        return "Couldn't remove that row — it may already be gone. Check /history."
+    _audit_async("delete", tx_id, "row deleted by user", user_id)
+    tail = "balance effect reversed" if was_active else "balances untouched (it was already reversed)"
+    return (f"🗑 <b>Deleted</b> {typ} {money(amount, currency)} on "
+            f"{_esc(str(r.get('Account') or '—'))} — row removed, {tail}.")
 
 
 def _audit_async(action, transaction_id, detail, user_id):

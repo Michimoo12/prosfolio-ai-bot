@@ -57,6 +57,11 @@ ALLOWED_ID = int(config.ALLOWED_TELEGRAM_USER_ID)
 pending = {}
 # User ids whose Confirm is currently being saved (guards double-taps).
 saving = set()
+# Waiting /delete confirmations: uid -> Transaction ID.
+pending_delete = {}
+# The Transaction IDs shown by the user's last /history, in display order,
+# so "/delete 2" can resolve the number to a real transaction.
+hist_map = {}
 # Per-user memory of the last message that parsed into actions but was
 # missing something (we asked e.g. "Which account?"). A short reply like
 # "unionbank" used to be parsed from scratch, lose all context, and get
@@ -184,9 +189,10 @@ def cmd_help(m):
         "<b>Commands</b>\n"
         "/balance – total + per-account balances\n"
         "/accounts – list your accounts\n"
-        "/history – last 10 transactions\n"
+        "/history – last 10 transactions (numbered)\n"
         "/report – this month's income, expenses, savings\n"
-        "/undo – reverse the last transaction\n"
+        "/undo – reverse the newest transaction\n"
+        "/delete 2 – permanently remove item #2 from /history\n"
         "/setbalance GCash 2032 – correct an account balance directly\n"
         "/setrate 58.9 – set the USD→PHP rate manually\n"
         "/rate – show current USD→PHP rate\n\n"
@@ -230,13 +236,17 @@ def cmd_history(m):
         return bot.reply_to(m, "No transactions yet.")
     lines = ["<b>Recent</b>"]
     signs = {"income": "+", "expense": "−", "adjustment": "±"}
-    for r in rows:
+    ids = []
+    for i, r in enumerate(rows, start=1):
         sign = signs.get(str(r.get("Type", "")).lower(), "↔")
         # _to_float instead of float(): the sheet can hand back "1,234.56" as
         # a formatted string, which float() refuses.
         amt = logic.money(sheets._to_float(r.get("Amount", 0)), r.get("Currency", "PHP"))
         tag = "  (reversed)" if str(r.get("Status", "")).lower() == "reversed" else ""
-        lines.append(f"{sign} {amt} · {esc(str(r.get('Account') or ''))} · {r.get('Transaction Date')}{tag}")
+        lines.append(f"{i}. {sign} {amt} · {esc(str(r.get('Account') or ''))} · {r.get('Transaction Date')}{tag}")
+        ids.append(str(r.get("Transaction ID", "")))
+    hist_map[m.from_user.id] = ids
+    lines.append("\n/undo reverses the newest · /delete 2 removes #2 permanently")
     bot.reply_to(m, "\n".join(lines))
 
 
@@ -277,6 +287,48 @@ def cmd_undo(m):
     if not authorized(m):
         return
     bot.reply_to(m, logic.undo_last(m.from_user.id))
+
+
+@bot.message_handler(commands=["delete"])
+@guarded
+def cmd_delete(m):
+    if not authorized(m):
+        return
+    # Usage: /delete 2 (number from your last /history) or /delete TX-AB12CD34
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return bot.reply_to(m, "Usage: /delete 2  (the number shown by /history)\n"
+                               "or /delete TX-AB12CD34\n\n"
+                               "Run /history first to see the numbers.")
+    ref = parts[1].strip()
+    if ref.isdigit():
+        ids = hist_map.get(m.from_user.id) or []
+        idx = int(ref) - 1
+        if idx < 0 or idx >= len(ids) or not ids[idx]:
+            return bot.reply_to(m, "That number isn't on your last /history list — "
+                                   "run /history again and use a number it shows.")
+        tx_id = ids[idx]
+    else:
+        tx_id = ref
+    r = sheets.find_transaction(tx_id)
+    if not r:
+        return bot.reply_to(m, "Couldn't find that transaction. Run /history and use the number shown.")
+    pending_delete[m.from_user.id] = str(r.get("Transaction ID"))
+    amt = logic.money(sheets._to_float(r.get("Amount", 0)), r.get("Currency", "PHP") or "PHP")
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🗑 Delete", callback_data="delconfirm"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+    )
+    bot.reply_to(
+        m,
+        "<b>Delete this transaction permanently?</b>\n"
+        f"{esc(str(r.get('Type') or ''))} · {amt} · {esc(str(r.get('Account') or ''))} · "
+        f"{esc(str(r.get('Transaction Date') or ''))}\n"
+        f"{esc(str(r.get('Description') or ''))}\n\n"
+        "The row is removed from your sheet and its balance effect is reversed.",
+        reply_markup=kb,
+    )
 
 
 @bot.message_handler(commands=["rate"])
@@ -618,8 +670,36 @@ def handle_button(c):
 
     if c.data == "cancel":
         pending.pop(uid, None)
+        pending_delete.pop(uid, None)
         return bot.edit_message_text("❌ Cancelled. Nothing was saved.",
                                       c.message.chat.id, c.message.message_id)
+
+    if c.data == "delconfirm":
+        if uid in saving:
+            return
+        tx_id = pending_delete.pop(uid, None)
+        if not tx_id:
+            try:
+                bot.edit_message_text("That request expired. Please send it again.",
+                                      c.message.chat.id, c.message.message_id)
+            except Exception:
+                pass
+            return
+        saving.add(uid)
+        typing(c.message.chat.id)
+        try:
+            result = logic.delete_transaction(tx_id, uid)
+        except Exception:
+            logging.exception("delete failed")
+            return bot.send_message(c.message.chat.id,
+                                    "⚠️ Couldn't delete that. Check /history — it may still be there.")
+        finally:
+            saving.discard(uid)
+        try:
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return bot.send_message(c.message.chat.id, result)
     if c.data == "edit":
         pending.pop(uid, None)
         return bot.edit_message_text("No problem — just send it again with the correction.",

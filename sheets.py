@@ -70,12 +70,33 @@ def _drop_cache(*keys):
 # reason cold messages got noticeably faster.
 
 def _records(vals):
-    """Raw batch values -> list of dicts, like get_all_records does."""
-    if not vals:
+    """
+    Raw sheet values -> list of dicts.
+
+    Tolerates real-world sheets: the header row is the FIRST row with at
+    least two non-empty cells — the user's actual Transactions tab has a
+    completely blank row 1 with the real headers on row 2, which made
+    get_all_records crash ("header row contains duplicates: ['']") and made
+    a naive vals[0] reader see zero usable rows (/history empty, /undo
+    "Nothing to undo"). Trailing empty header cells are trimmed and fully
+    blank data rows are skipped.
+    """
+    hdr_idx = None
+    for i, row in enumerate(vals[:10]):
+        if sum(1 for c in row if str(c).strip()) >= 2:
+            hdr_idx = i
+            break
+    if hdr_idx is None:
         return []
-    headers = [str(h).strip() for h in vals[0]]
+    headers = [str(h).strip() for h in vals[hdr_idx]]
+    while headers and not headers[-1]:
+        headers.pop()
+    if not headers:
+        return []
     out = []
-    for row in vals[1:]:
+    for row in vals[hdr_idx + 1:]:
+        if not any(str(c).strip() for c in row):
+            continue
         row = list(row) + [""] * (len(headers) - len(row))
         out.append(dict(zip(headers, row[:len(headers)])))
     return out
@@ -139,8 +160,21 @@ def _ws(title):
 
 
 def _header(ws):
-    """Header row of a tab, cached — headers don't change while the bot runs."""
-    return _cached("hdr:" + ws.title, lambda: _api(lambda: ws.row_values(1)), ttl=600)
+    """
+    Header row of a tab, cached. NOT assumed to be row 1 — scans the first
+    ten rows for the first one that has at least two filled cells (the
+    user's Transactions tab keeps its headers on row 2 under a blank row).
+    """
+    def fetch():
+        rows = _api(lambda: ws.get_values("A1:Z10"))
+        for row in rows:
+            if sum(1 for c in row if str(c).strip()) >= 2:
+                trimmed = [str(h).strip() for h in row]
+                while trimmed and not trimmed[-1]:
+                    trimmed.pop()
+                return trimmed
+        return []
+    return _cached("hdr:" + ws.title, fetch, ttl=600)
 
 
 def _row_for(ws, col_index, value):
@@ -285,6 +319,27 @@ def mark_reversed(transaction_id):
     row = _row_for(ws, id_col, transaction_id)
     if row:
         _api(lambda: ws.update_cell(row, status_col, "Reversed"))
+
+
+def find_transaction(tx_id):
+    """The full row dict for one Transaction ID, or None."""
+    target = str(tx_id).strip().lower()
+    for r in _transactions():
+        if str(r.get("Transaction ID", "")).strip().lower() == target:
+            return r
+    return None
+
+
+def delete_transaction_row(tx_id):
+    """Physically remove a transaction's row from the sheet."""
+    ws = _ws(config.SHEET_TRANSACTIONS)
+    header = _header(ws)
+    id_col = header.index("Transaction ID") + 1
+    row = _row_for(ws, id_col, tx_id)
+    if not row:
+        return False
+    _api(lambda: ws.delete_rows(row))
+    return True
 
 # ---------- Settings ----------
 
