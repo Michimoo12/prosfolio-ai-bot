@@ -224,13 +224,24 @@ def append_transaction(tx):
     return tx.get("Transaction ID", "")
 
 
+def _transactions():
+    """
+    All transaction rows as dicts. Uses raw values + _records() instead of
+    gspread's get_all_records(), which refuses to read the tab at all if any
+    row has stray content beyond the 16 header columns ("header row contains
+    duplicates: ['']"). _records() just ignores anything beyond the headers,
+    so one stray cell can't take down /history, /report, /undo and chat.
+    """
+    return _records(_api(lambda: _ws(config.SHEET_TRANSACTIONS).get_values()))
+
+
 def get_recent_transactions(n=10):
-    rows = _api(lambda: _ws(config.SHEET_TRANSACTIONS).get_all_records())
+    rows = _transactions()
     return rows[-n:][::-1]
 
 
 def get_month_transactions(year_month):
-    rows = _api(lambda: _ws(config.SHEET_TRANSACTIONS).get_all_records())
+    rows = _transactions()
     out = []
     for r in rows:
         d = str(r.get("Transaction Date", ""))

@@ -305,9 +305,11 @@ def undo_last(user_id):
 
 def _reverse(r, user_id):
     typ = str(r.get("Type", "")).lower()
-    amount = float(r.get("Amount", 0) or 0)
+    # _to_float, not float(): rows read back from the sheet can carry
+    # formatted strings like "1,234.56" or "₱-4,000".
+    amount = sheets._to_float(r.get("Amount", 0))
     currency = r.get("Currency", "PHP") or "PHP"
-    stored_rate = float(r.get("Exchange Rate", 1) or 1)
+    stored_rate = sheets._to_float(r.get("Exchange Rate", 1)) or 1
     if typ == "adjustment":
         acct = sheets.get_account(r.get("Account"))
         # Amount is the signed delta the correction applied — undo by

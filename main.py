@@ -54,6 +54,8 @@ ALLOWED_ID = int(config.ALLOWED_TELEGRAM_USER_ID)
 
 # Remembers the transaction(s) waiting for your Confirm tap. Keyed by user id.
 pending = {}
+# User ids whose Confirm is currently being saved (guards double-taps).
+saving = set()
 
 # Escape user-typed names/notes before they go inside HTML replies. Without
 # this, an account called "R&B" or a note containing "<3" makes Telegram
@@ -571,24 +573,42 @@ def handle_button(c):
         return bot.edit_message_text("No problem — just send it again with the correction.",
                                       c.message.chat.id, c.message.message_id)
     if c.data == "confirm":
+        # Ignore taps that land while a save for this user is already running
+        # (a fast double-tap used to edit the card to "expired" mid-save and
+        # then trip a Telegram 400 when the buttons were removed twice).
+        if uid in saving:
+            return
         # Pop BEFORE applying. TeleBot runs handlers on worker threads, so a
         # double-tap on Confirm used to deliver two callbacks that could both
-        # see the same pending items and save the transaction twice. Popping
-        # first makes the second tap harmlessly hit "expired."
+        # see the same pending items and save the transaction twice.
         items = pending.pop(uid, None)
         if not items:
-            return bot.edit_message_text("That request expired. Please send it again.",
-                                          c.message.chat.id, c.message.message_id)
+            try:
+                bot.edit_message_text("That request expired. Please send it again.",
+                                      c.message.chat.id, c.message.message_id)
+            except Exception:
+                pass  # e.g. re-tapping an already-expired card: text unchanged -> 400
+            return
+        saving.add(uid)
         typing(c.message.chat.id)
         try:
             results = [logic.apply(tx, uid) for tx in items]
-            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
-            bot.send_message(c.message.chat.id, "\n\n".join(results))
         except Exception:
             logging.exception("confirm failed")
-            bot.send_message(c.message.chat.id,
-                             "⚠️ Couldn't save that. Check /history before retrying — "
-                             "part of it may have been saved. (Details are in the deploy logs.)")
+            return bot.send_message(
+                c.message.chat.id,
+                "⚠️ Couldn't save that. Check /history before retrying — "
+                "part of it may have been saved. (Details are in the deploy logs.)")
+        finally:
+            saving.discard(uid)
+        # The save SUCCEEDED past this point. Removing the buttons is purely
+        # cosmetic — if it fails (e.g. they're already gone), never let that
+        # turn a successful save into a scary ⚠️ message.
+        try:
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        bot.send_message(c.message.chat.id, "\n\n".join(results))
 
 
 # ---------------- entry point ----------------
