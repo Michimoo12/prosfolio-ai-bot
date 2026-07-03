@@ -150,8 +150,14 @@ Account balances:
 Recent transactions:
 {tx_lines}
 
+Expense categories: {", ".join(context["expense_categories"])}
+Income categories: {", ".join(context["income_categories"])}
 Income sources: {", ".join(context["income_sources"])}
 Clients: {", ".join(context["clients"])}
+
+If asked what categories/accounts/clients exist, list them from the data
+above exactly — never invent names that aren't there. (/categories,
+/accounts and /clients also show these as commands.)
 """
     try:
         msg = _client.messages.create(
