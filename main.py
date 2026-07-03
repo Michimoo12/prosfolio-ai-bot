@@ -190,6 +190,7 @@ def cmd_help(m):
         "/balance – total + per-account balances\n"
         "/accounts – list your accounts\n"
         "/history – last 10 transactions (numbered)\n"
+        "/transactions – every transaction this month\n"
         "/report – this month's income, expenses, savings\n"
         "/undo – reverse the newest transaction\n"
         "/delete 2 – permanently remove item #2 from /history\n"
@@ -265,6 +266,59 @@ def cmd_history(m):
     hist_map[m.from_user.id] = ids
     lines.append("\n/undo reverses the newest · /delete 2 removes #2 permanently")
     bot.reply_to(m, "\n".join(lines))
+
+
+@bot.message_handler(commands=["transactions"])
+@guarded
+def cmd_transactions(m):
+    if not authorized(m):
+        return
+    # Usage: /transactions            -> everything this month
+    #        /transactions 2026-06    -> a specific month
+    parts = m.text.split()
+    if len(parts) > 1:
+        ym = parts[1].strip()
+        if not re.fullmatch(r"\d{4}-\d{2}", ym):
+            return bot.reply_to(m, "Usage: /transactions  (this month)\n"
+                                   "or /transactions 2026-06  (a specific month)")
+    else:
+        ym = config.now().strftime("%Y-%m")
+    rows = sheets.get_month_transactions(ym)
+    if not rows:
+        return bot.reply_to(m, f"No transactions in {ym} yet.")
+    signs = {"income": "+", "expense": "−", "adjustment": "±"}
+    lines = [f"<b>🗓 {ym} — {len(rows)} transaction{'s' if len(rows) != 1 else ''}</b>"]
+    ids = []
+    income = expense = 0.0
+    for i, r in enumerate(rows, start=1):
+        typ = str(r.get("Type", "")).lower()
+        sign = signs.get(typ, "↔")
+        amt = logic.money(sheets._to_float(r.get("Amount", 0)), r.get("Currency", "PHP"))
+        cat = str(r.get("Category") or "").strip()
+        cat_txt = f" · {esc(cat)}" if cat else ""
+        lines.append(f"{i}. {sign} {amt}{cat_txt} · {esc(str(r.get('Account') or ''))}"
+                     f" · {esc(str(r.get('Transaction Date') or ''))}")
+        ids.append(str(r.get("Transaction ID", "")))
+        php = sheets._to_float(r.get("PHP Equivalent", 0))
+        if typ == "income":
+            income += php
+        elif typ == "expense":
+            expense += php
+    hist_map[m.from_user.id] = ids
+    lines.append(f"\nIncome {logic.peso(income)} · Expenses {logic.peso(expense)}"
+                 f" · Net {logic.peso(income - expense)}")
+    lines.append("/delete 3 removes #3 · /report for the summary")
+    # Telegram caps messages at 4096 chars — send long months in chunks.
+    chunk, first = [], True
+    for line in lines:
+        if chunk and sum(len(x) + 1 for x in chunk) + len(line) > 3500:
+            text = "\n".join(chunk)
+            (bot.reply_to(m, text) if first else bot.send_message(m.chat.id, text))
+            first, chunk = False, []
+        chunk.append(line)
+    if chunk:
+        text = "\n".join(chunk)
+        (bot.reply_to(m, text) if first else bot.send_message(m.chat.id, text))
 
 
 @bot.message_handler(commands=["report"])
